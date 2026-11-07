@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="goldFav" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef08a" />
+      <stop offset="100%" stop-color="#d97706" />
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#0f172a" stroke="url(#goldFav)" stroke-width="2.5" />
+
+  <!-- Garrí Velvet Jacket -->
+  <path d="M 16 50 C 16 42, 22 40, 30 40 C 38 40, 44 42, 44 50 L 46 60 L 14 60 Z" fill="#1e293b" />
+  <circle cx="30" cy="46" r="1.5" fill="#f59e0b" />
+  <circle cx="30" cy="52" r="1.5" fill="#f59e0b" />
+
+  <!-- Head & Montera -->
+  <ellipse cx="30" cy="31" rx="9" ry="10" fill="#fed7aa" />
+  <path d="M 18 25 C 22 17, 30 18, 38 18 C 46 18, 50 21, 52 26 C 48 29, 22 29, 18 25 Z" fill="#020617" stroke="#475569" stroke-width="0.8" />
+
+  <!-- Authentic Guiato (Mallorcan Hook Crook Staff) -->
+  <path d="M 47 34 C 46 28, 49 24, 54 24 C 58 24, 58 28, 58 32 L 58 60 L 55 60 L 55 32 C 55 29, 55 26, 53 26 C 51 26, 49 29, 49 34 Z" fill="url(#goldFav)" />
+</svg>

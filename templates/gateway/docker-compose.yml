@@ -1,0 +1,29 @@
+# Central Gateway Reverse Proxy (Caddy)
+# Serves as the Application Load Balancer (ALB) and SSL termination for all apps on the host
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 (QUIC)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./conf.d:/etc/caddy/conf.d:ro
+      - ./logs:/var/log/caddy
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - gateway
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  gateway:
+    name: gateway
+    external: true

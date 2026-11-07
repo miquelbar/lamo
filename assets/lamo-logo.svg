@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 240" width="800" height="240">
+  <defs>
+    <linearGradient id="bannerBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="50%" stop-color="#090d16" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+
+    <linearGradient id="goldGradL" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef08a" />
+      <stop offset="40%" stop-color="#f59e0b" />
+      <stop offset="80%" stop-color="#d97706" />
+      <stop offset="100%" stop-color="#92400e" />
+    </linearGradient>
+
+    <clipPath id="circleClipLamo">
+      <circle cx="120" cy="120" r="95" />
+    </clipPath>
+  </defs>
+
+  <rect x="0" y="0" width="800" height="240" rx="16" fill="url(#bannerBg)" stroke="#1e293b" stroke-width="2" />
+
+  <!-- Left Circular Emblem -->
+  <circle cx="120" cy="120" r="102" fill="none" stroke="url(#goldGradL)" stroke-width="4" />
+  <circle cx="120" cy="120" r="97" fill="#0f172a" />
+
+  <g clip-path="url(#circleClipLamo)">
+    <!-- Sky & Sun -->
+    <rect x="25" y="25" width="190" height="190" fill="#0284c7" />
+    <circle cx="75" cy="65" r="14" fill="#ffffff" opacity="0.9" />
+    <path d="M 25 155 Q 85 135, 145 148 T 215 142 L 215 220 L 25 220 Z" fill="#ca8a04" />
+    <ellipse cx="55" cy="140" rx="18" ry="12" fill="#14532d" />
+
+    <!-- L'Amo Figure Representation -->
+    <path d="M 105 150 C 100 175, 102 205, 106 220 L 166 220 C 170 205, 172 175, 168 150 Z" fill="#0f172a" />
+    <circle cx="136" cy="165" r="2.5" fill="#f59e0b" />
+    <circle cx="136" cy="180" r="2.5" fill="#f59e0b" />
+    <circle cx="136" cy="195" r="2.5" fill="#f59e0b" />
+    <path d="M 128 145 L 136 158 L 144 145 Z" fill="#dc2626" />
+    <ellipse cx="136" cy="118" rx="18" ry="21" fill="#fdba74" />
+    <!-- Montera -->
+    <path d="M 112 108 C 120 92, 136 94, 150 94 C 164 94, 180 92, 188 108 C 180 114, 120 114, 112 108 Z" fill="#1e293b" stroke="#000000" stroke-width="1.2" />
+    <!-- Authentic Guiato (Curved crook shepherd/overseer staff) -->
+    <path d="M 172 144 C 170 132, 175 125, 184 125 C 191 125, 191 133, 191 142 L 191 220 L 186 220 L 186 142 C 186 136, 187 130, 183 130 C 179 130, 176 136, 176 144 Z" fill="#381a08" />
+  </g>
+
+  <!-- Typography Right Section -->
+  <g transform="translate(255, 0)">
+    <text x="0" y="102" 
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" 
+          font-size="78" 
+          font-weight="900" 
+          letter-spacing="5" 
+          fill="url(#goldGradL)">lamo</text>
+
+    <text x="4" y="145" 
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" 
+          font-size="19" 
+          font-weight="700" 
+          letter-spacing="5" 
+          fill="#f8fafc">L'AMO :: ESTATE ORCHESTRATOR</text>
+
+    <text x="4" y="178" 
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" 
+          font-size="13" 
+          font-weight="500" 
+          letter-spacing="0.5" 
+          fill="#94a3b8">Local Infrastructure CLI · Zero-Friction Management · Multi-Node Control</text>
+  </g>
+</svg>

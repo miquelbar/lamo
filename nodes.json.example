@@ -1,0 +1,31 @@
+{
+  "default": "node-1",
+  "nodes": {
+    "node-1": {
+      "name": "node-1",
+      "host": "192.0.2.10",
+      "port": 2245,
+      "user": "admin",
+      "bootstrap_user": "root",
+      "bootstrap_port": 22,
+      "hostname": "node-1",
+      "container_runtime": "docker",
+      "notes": "Primary cattle server (Docker CE)"
+    },
+    "worker-2": {
+      "name": "worker-2",
+      "host": "198.51.100.25",
+      "port": 2245,
+      "user": "admin",
+      "bootstrap_user": "root",
+      "bootstrap_port": 22,
+      "hostname": "worker-2",
+      "container_runtime": "podman",
+      "notes": "Secondary worker node (Podman)",
+      "audit_retention_days": 7,
+      "journald_max_use_mb": 150,
+      "docker_log_max_size": "10m",
+      "docker_log_max_files": "3"
+    }
+  }
+}

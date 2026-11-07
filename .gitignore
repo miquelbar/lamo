@@ -1,0 +1,20 @@
+# Local node inventory and sensitive credentials
+inventory/
+.lamo/
+config.env
+nodes.json
+*.env
+*.env.local
+!*.env.example
+
+# Keys and secrets
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# OS and temporary files
+.DS_Store
+__pycache__/
+*.pyc
+/tmp/

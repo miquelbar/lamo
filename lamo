@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+"""
+Lamo (L'Amo) - Local Multi-Server & Application Orchestrator
+Inspired by the Mallorcan 'L'Amo' (the estate overseer and administrator).
+Orchestrates remote cattle servers running 'bover' (Es Bover) runtime worker daemon.
+Zero-friction multi-server management without requiring raw Make targets.
+"""
+
+import sys
+import os
+import re
+import json
+import shlex
+import argparse
+import subprocess
+import shutil
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = None
+NODES_CONFIG_PATH = None
+SSH_MUX_DIR = Path(f"/tmp/ssh-mux-{os.getuid()}")
+SSH_MUX_DIR.mkdir(parents=True, exist_ok=True)
+
+# ANSI Colors
+GOLD = "\033[38;5;214m"
+CYAN = "\033[38;5;75m"
+GREEN = "\033[38;5;78m"
+RED = "\033[38;5;203m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+ANSI_REGEX = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def visible_len(s):
+    """Return visible character length of string excluding ANSI escape sequences."""
+    return len(ANSI_REGEX.sub("", str(s)))
+
+
+def format_table(headers, rows, max_width=None):
+    """
+    Format rows into a clean, aligned table adapting dynamically to terminal width.
+    Automatically clips cell content if total width exceeds max_width or terminal columns.
+    """
+    if max_width is None:
+        try:
+            term_cols = shutil.get_terminal_size((80, 24)).columns
+            max_width = min(max(term_cols, 72), 100)
+        except Exception:
+            max_width = 80
+
+    num_cols = len(headers)
+    widths = [visible_len(h) for h in headers]
+    for row in rows:
+        for i, val in enumerate(row):
+            if i < num_cols:
+                widths[i] = max(widths[i], visible_len(val))
+
+    total = sum(widths) + (num_cols - 1) * 2
+    if total > max_width:
+        excess = total - max_width
+        widest_idx = widths.index(max(widths))
+        widths[widest_idx] = max(8, widths[widest_idx] - excess)
+
+    header_cells = []
+    for i, h in enumerate(headers):
+        header_cells.append(h + " " * max(0, widths[i] - visible_len(h)))
+    header_line = "  ".join(header_cells)
+    sep_line = "-" * len(header_line)
+
+    row_lines = []
+    for row in rows:
+        cells = []
+        for i, val in enumerate(row):
+            if i >= num_cols:
+                continue
+            s = str(val)
+            v_len = visible_len(s)
+            w = widths[i]
+            if v_len > w:
+                s = s[:w-1] + "…" if w > 2 else s[:w]
+                v_len = visible_len(s)
+            cells.append(s + " " * max(0, w - v_len))
+        row_lines.append("  ".join(cells))
+
+    return header_line, sep_line, row_lines
+
+
+def validate_app_name(name: str) -> str:
+    """Validate app name to prevent shell injection or path traversal."""
+    if not name:
+        return ""
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$", name) or ".." in name or "/" in name or "\\" in name:
+        print(f"{RED}ERROR: Invalid application name '{name}'. Must be 1-32 alphanumeric characters, dashes, or dots.{RESET}", file=sys.stderr)
+        sys.exit(1)
+    return name
+
+
+def validate_cron_id(job_id: str) -> str:
+    """Validate cron job ID to prevent shell injection or path traversal."""
+    if not job_id or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,47}$", job_id) or ".." in job_id:
+        print(f"{RED}ERROR: Invalid cron job ID '{job_id}'. Must be 1-48 alphanumeric characters, dashes, underscores, or dots.{RESET}", file=sys.stderr)
+        sys.exit(1)
+    return job_id
+
+
+def get_active_config_path():
+    """Resolve active config.env path prioritizing inventory/ or .lamo/ over root."""
+    if CONFIG_PATH is not None:
+        return Path(CONFIG_PATH)
+    for p in [BASE_DIR / "inventory" / "config.env", BASE_DIR / ".lamo" / "config.env", BASE_DIR / "config.env"]:
+        if p.exists():
+            return p
+    return BASE_DIR / "inventory" / "config.env"
+
+
+def get_active_nodes_path():
+    """Resolve active nodes.json path prioritizing inventory/ or .lamo/ over root."""
+    if NODES_CONFIG_PATH is not None:
+        return Path(NODES_CONFIG_PATH)
+    for p in [BASE_DIR / "inventory" / "nodes.json", BASE_DIR / ".lamo" / "nodes.json", BASE_DIR / "nodes.json"]:
+        if p.exists():
+            return p
+    return BASE_DIR / "inventory" / "nodes.json"
+
+
+def load_base_config(allow_empty=False):
+    """Load baseline configuration variables from config.env or fallback to defaults."""
+    cfg = {
+        "SERVER_IP": "",
+        "ADMIN_USER": "admin",
+        "SSH_PORT": "2245",
+        "BOOTSTRAP_USER": "root",
+        "BOOTSTRAP_PORT": "22",
+        "SERVER_HOSTNAME": "myserver",
+        "SWAP_SIZE_GB": "2",
+        "USER_AUDIT_RETENTION_DAYS": "7",
+        "JOURNALD_MAX_USE_MB": "150",
+        "DOCKER_LOG_MAX_SIZE": "10m",
+        "DOCKER_LOG_MAX_FILES": "3",
+    }
+
+    config_file = get_active_config_path()
+    nodes_file = get_active_nodes_path()
+
+    nodes_exist = False
+    if nodes_file.exists():
+        try:
+            with open(nodes_file, "r") as f:
+                data = json.load(f)
+                if data.get("nodes"):
+                    nodes_exist = True
+        except Exception:
+            pass
+
+    if not config_file.exists() and not nodes_exist and not allow_empty:
+        print(f"{RED}ERROR: Neither config.env nor nodes.json found in {BASE_DIR}.{RESET}")
+        print(f"Run: {CYAN}./lamo setup{RESET} to configure and bootstrap your first VPS.")
+        sys.exit(1)
+
+    if config_file.exists():
+        with open(config_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    cfg[k] = v
+
+    if not cfg.get("SERVER_IP") and not nodes_exist and not allow_empty:
+        print(f"{RED}ERROR: SERVER_IP is empty in config.env and no nodes configured in nodes.json{RESET}")
+        print(f"Run: {CYAN}./lamo setup{RESET} to configure and bootstrap your first VPS.")
+        sys.exit(1)
+
+    return cfg
+
+
+def get_nodes_registry(base_cfg):
+    """Load or initialize multi-server cattle registry (nodes.json)."""
+    nodes_file = get_active_nodes_path()
+    if nodes_file.exists():
+        try:
+            with open(nodes_file, "r") as f:
+                data = json.load(f)
+                if "nodes" in data and data["nodes"]:
+                    return data
+        except Exception:
+            pass
+
+    if not base_cfg.get("SERVER_IP"):
+        return {"default": None, "nodes": {}}
+
+    # Initialize from config.env
+    default_name = base_cfg.get("SERVER_HOSTNAME", "node-1")
+    data = {
+        "default": default_name,
+        "nodes": {
+            default_name: {
+                "name": default_name,
+                "host": base_cfg["SERVER_IP"],
+                "port": int(base_cfg.get("SSH_PORT", 2245)),
+                "user": base_cfg.get("ADMIN_USER", "admin"),
+                "bootstrap_user": base_cfg.get("BOOTSTRAP_USER", "root"),
+                "bootstrap_port": int(base_cfg.get("BOOTSTRAP_PORT", 22)),
+                "hostname": default_name,
+                "container_runtime": base_cfg.get("CONTAINER_RUNTIME", "docker"),
+                "notes": "Primary cattle server",
+            }
+        }
+    }
+    nodes_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(nodes_file, "w") as f:
+        json.dump(data, f, indent=2)
+    return data
+
+
+def save_nodes_registry(data):
+    """Save multi-server registry."""
+    nodes_file = get_active_nodes_path()
+    nodes_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(nodes_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def resolve_active_node(base_cfg, target_node_name=None):
+    """Resolve target cattle node configuration for execution."""
+    reg = get_nodes_registry(base_cfg)
+    node_name = target_node_name or reg.get("default")
+    if not node_name or node_name not in reg.get("nodes", {}):
+        available = ", ".join(reg.get("nodes", {}).keys())
+        print(f"{RED}ERROR: Node '{node_name}' not found in nodes.json.{RESET}")
+        print(f"Configured cattle nodes: {CYAN}{available}{RESET}")
+        sys.exit(1)
+
+    node_data = reg["nodes"][node_name]
+    cfg = dict(base_cfg)
+    cfg["NODE_NAME"] = node_name
+    cfg["SERVER_IP"] = node_data["host"]
+    cfg["SSH_PORT"] = str(node_data.get("port", 2245))
+    cfg["ADMIN_USER"] = node_data.get("user", base_cfg.get("ADMIN_USER", "admin"))
+    cfg["SERVER_HOSTNAME"] = node_data.get("hostname", node_name)
+    if "bootstrap_user" in node_data:
+        cfg["BOOTSTRAP_USER"] = node_data["bootstrap_user"]
+    if "bootstrap_port" in node_data:
+        cfg["BOOTSTRAP_PORT"] = str(node_data["bootstrap_port"])
+
+    # Per-node logging & audit overrides (with fallback to base_cfg or defaults)
+    if "audit_retention_days" in node_data:
+        cfg["USER_AUDIT_RETENTION_DAYS"] = str(node_data["audit_retention_days"])
+    elif "USER_AUDIT_RETENTION_DAYS" in node_data:
+        cfg["USER_AUDIT_RETENTION_DAYS"] = str(node_data["USER_AUDIT_RETENTION_DAYS"])
+    if "journald_max_use_mb" in node_data:
+        cfg["JOURNALD_MAX_USE_MB"] = str(node_data["journald_max_use_mb"])
+    elif "JOURNALD_MAX_USE_MB" in node_data:
+        cfg["JOURNALD_MAX_USE_MB"] = str(node_data["JOURNALD_MAX_USE_MB"])
+    if "docker_log_max_size" in node_data:
+        cfg["DOCKER_LOG_MAX_SIZE"] = str(node_data["docker_log_max_size"])
+    elif "DOCKER_LOG_MAX_SIZE" in node_data:
+        cfg["DOCKER_LOG_MAX_SIZE"] = str(node_data["DOCKER_LOG_MAX_SIZE"])
+    if "docker_log_max_files" in node_data:
+        cfg["DOCKER_LOG_MAX_FILES"] = str(node_data["docker_log_max_files"])
+    elif "DOCKER_LOG_MAX_FILES" in node_data:
+        cfg["DOCKER_LOG_MAX_FILES"] = str(node_data["DOCKER_LOG_MAX_FILES"])
+
+    runtime_val = node_data.get("container_runtime", node_data.get("runtime", base_cfg.get("CONTAINER_RUNTIME", "docker")))
+    cfg["CONTAINER_RUNTIME"] = str(runtime_val).lower()
+
+    return cfg, reg
+
+
+def get_ssh_mux_opts(cfg):
+    """Return SSH multiplexing arguments tailored per node socket."""
+    node_socket = SSH_MUX_DIR / f"{cfg.get('NODE_NAME', 'default')}.sock"
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={node_socket}",
+        "-o", "ControlPersist=10m",
+        "-o", "ConnectTimeout=4",
+        "-o", "LogLevel=ERROR",
+    ]
+
+
+def run_ssh(cfg, remote_cmd, interactive=False, capture=False, check=True):
+    """Execute command on remote cattle node over multiplexed SSH."""
+    mux_opts = get_ssh_mux_opts(cfg)
+    ssh_cmd = [
+        "ssh",
+        *mux_opts,
+        "-p", str(cfg["SSH_PORT"]),
+    ]
+    if interactive:
+        ssh_cmd.append("-t")
+
+    ssh_cmd.append(f"{cfg['ADMIN_USER']}@{cfg['SERVER_IP']}")
+    if remote_cmd:
+        ssh_cmd.append(remote_cmd)
+
+    if interactive:
+        res = subprocess.run(ssh_cmd)
+        return res.returncode
+
+    res = subprocess.run(
+        ssh_cmd,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=check,
+    )
+    if capture:
+        return res.stdout.strip() if res.stdout else ""
+    return res.returncode
+
+
+def cmd_ping(cfg):
+    """Test SSH connectivity to the targeted cattle node."""
+    print(f"==> Contacting cattle node {GOLD}{cfg.get('NODE_NAME', 'default')}{RESET} ({CYAN}{cfg['SERVER_IP']}:{cfg['SSH_PORT']}{RESET}) as {BOLD}{cfg['ADMIN_USER']}{RESET}...")
+    try:
+        out = run_ssh(cfg, "echo 'PONG'", capture=True)
+        if "PONG" in out:
+            print(f"{GREEN}✓ Connected successfully to node '{cfg.get('NODE_NAME')}' ({cfg['SERVER_IP']}:{cfg['SSH_PORT']}){RESET}")
+            return 0
+    except Exception:
+        pass
+
+    # Fallback bootstrap check
+    print(f"Port {cfg['SSH_PORT']} not reachable. Checking bootstrap port {cfg['BOOTSTRAP_PORT']}...")
+    try:
+        res = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=4", "-p", str(cfg["BOOTSTRAP_PORT"]), f"{cfg['BOOTSTRAP_USER']}@{cfg['SERVER_IP']}", "echo 'PONG'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if "PONG" in res.stdout:
+            print(f"{GOLD}⚡ Node is reachable on bootstrap port {cfg['BOOTSTRAP_PORT']}. Run 'lamo setup' to complete provisioning.{RESET}")
+            return 0
+    except Exception:
+        pass
+
+    print(f"{RED}✗ Node '{cfg.get('NODE_NAME')}' ({cfg['SERVER_IP']}) unreachable on ports {cfg['SSH_PORT']} and {cfg['BOOTSTRAP_PORT']}.{RESET}")
+    return 1
+
+
+def get_node_env(cfg):
+    """Generate environment variables to pass active cattle node parameters to state.py."""
+    env = os.environ.copy()
+    env["SERVER_IP"] = cfg["SERVER_IP"]
+    env["SSH_PORT"] = str(cfg["SSH_PORT"])
+    env["ADMIN_USER"] = cfg["ADMIN_USER"]
+    env["SERVER_HOSTNAME"] = cfg["SERVER_HOSTNAME"]
+    env["BOOTSTRAP_USER"] = cfg.get("BOOTSTRAP_USER", "root")
+    env["BOOTSTRAP_PORT"] = str(cfg.get("BOOTSTRAP_PORT", 22))
+    env["NODE_NAME"] = cfg.get("NODE_NAME", "default")
+    env["SWAP_SIZE_GB"] = str(cfg.get("SWAP_SIZE_GB", 2))
+    env["USER_AUDIT_RETENTION_DAYS"] = str(cfg.get("USER_AUDIT_RETENTION_DAYS", "7"))
+    env["JOURNALD_MAX_USE_MB"] = str(cfg.get("JOURNALD_MAX_USE_MB", "150"))
+    env["DOCKER_LOG_MAX_SIZE"] = str(cfg.get("DOCKER_LOG_MAX_SIZE", "10m"))
+    env["DOCKER_LOG_MAX_FILES"] = str(cfg.get("DOCKER_LOG_MAX_FILES", "3"))
+    env["CONTAINER_RUNTIME"] = str(cfg.get("CONTAINER_RUNTIME", "docker")).lower()
+    return env
+
+
+def cmd_status(cfg):
+    """Inspect node provisioning state."""
+    state_script = BASE_DIR / "scripts" / "state.py"
+    subprocess.run([sys.executable, str(state_script), "status"], cwd=BASE_DIR, env=get_node_env(cfg))
+
+
+def ensure_local_ssh_key() -> Path:
+    """Locate an existing local SSH public key or generate an ed25519 key pair automatically."""
+    ssh_dir = Path.home() / ".ssh"
+    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for key_name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
+        candidate = ssh_dir / key_name
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+
+    priv_key = ssh_dir / "id_ed25519"
+    pub_key = ssh_dir / "id_ed25519.pub"
+    print(f"==> No local SSH key found in ~/.ssh. Generating new Ed25519 SSH key ({priv_key})...")
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv_key)],
+        check=True,
+    )
+    return pub_key
+
+
+def ensure_ssh_login_and_key(cfg) -> bool:
+    """
+    Verify passwordless SSH key access to the VPS before running the automated pipeline.
+    1. Checks hardened port (ADMIN_USER@SERVER_IP:SSH_PORT) first.
+    2. Checks bootstrap port (BOOTSTRAP_USER@SERVER_IP:BOOTSTRAP_PORT) with BatchMode=yes.
+    3. If bootstrap port requires a password (fresh VPS), installs the local SSH public key
+       into BOOTSTRAP_USER's ~/.ssh/authorized_keys in a single interactive prompt so that
+       all subsequent provisioning steps execute 100% unattended.
+    """
+    host = cfg["SERVER_IP"]
+    admin_user = cfg["ADMIN_USER"]
+    ssh_port = str(cfg["SSH_PORT"])
+    boot_user = cfg.get("BOOTSTRAP_USER", "root")
+    boot_port = str(cfg.get("BOOTSTRAP_PORT", 22))
+    mux_opts = get_ssh_mux_opts(cfg)
+
+    print(f"==> Verifying SSH login to {GOLD}{cfg.get('NODE_NAME', host)}{RESET} ({CYAN}{host}{RESET})...")
+
+    # 1. Check if already hardened and reachable on SSH_PORT with SSH key
+    hardened_check = subprocess.run(
+        [
+            "ssh", *mux_opts,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", ssh_port,
+            f"{admin_user}@{host}",
+            "echo PONG",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if hardened_check.returncode == 0 and "PONG" in hardened_check.stdout:
+        print(f"{GREEN}✓ Hardened SSH login verified ({admin_user}@{host}:{ssh_port}).{RESET}")
+        return True
+
+    # 2. Check if bootstrap port already accepts our SSH key without password
+    boot_check = subprocess.run(
+        [
+            "ssh",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", boot_port,
+            f"{boot_user}@{host}",
+            "echo PONG",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if boot_check.returncode == 0 and "PONG" in boot_check.stdout:
+        print(f"{GREEN}✓ Bootstrap SSH key login verified ({boot_user}@{host}:{boot_port}).{RESET}")
+        return True
+
+    # 3. Fresh VPS: copy local SSH public key to bootstrap user (prompts for root password once)
+    pub_key_path = ensure_local_ssh_key()
+    pub_key_content = pub_key_path.read_text().strip()
+    print(
+        f"\n{GOLD}⚡ Initial VPS Login Setup:{RESET} Installing your SSH key ({CYAN}{pub_key_path.name}{RESET}) "
+        f"into {BOLD}{boot_user}@{host}:{boot_port}{RESET}."
+    )
+    print(f"{DIM}   If prompted, enter the initial '{boot_user}' password from your VPS provider once.{RESET}\n")
+
+    remote_install_key_cmd = (
+        "umask 077 && mkdir -p ~/.ssh && "
+        f"grep -qxF {shlex.quote(pub_key_content)} ~/.ssh/authorized_keys 2>/dev/null || "
+        f"printf '%s\\n' {shlex.quote(pub_key_content)} >> ~/.ssh/authorized_keys && "
+        "chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && echo KEY_INSTALLED"
+    )
+    install_res = subprocess.run(
+        [
+            "ssh",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", boot_port,
+            f"{boot_user}@{host}",
+            remote_install_key_cmd,
+        ]
+    )
+    if install_res.returncode != 0:
+        print(f"{RED}✗ Failed to authenticate or install SSH key on {boot_user}@{host}:{boot_port}.{RESET}")
+        return False
+
+    # Verify passwordless login now works
+    verify_res = subprocess.run(
+        [
+            "ssh",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-p", boot_port,
+            f"{boot_user}@{host}",
+            "echo PONG",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if verify_res.returncode == 0 and "PONG" in verify_res.stdout:
+        print(f"{GREEN}✓ SSH public key installed! Passwordless login to {boot_user}@{host}:{boot_port} is ready.{RESET}\n")
+        return True
+
+    print(f"{RED}✗ SSH key was uploaded, but passwordless login verification failed on {boot_user}@{host}:{boot_port}.{RESET}")
+    return False
+
+
+def bootstrap_vps_wizard(base_cfg, args=None):
+    """
+    Interactive (or flag-driven) wizard to configure the first VPS (or a new VPS),
+    persisting inventory/config.env and inventory/nodes.json before automated setup.
+    """
+    nodes_file = get_active_nodes_path()
+    reg = {"default": None, "nodes": {}}
+    if nodes_file.exists():
+        try:
+            with open(nodes_file, "r") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict) and "nodes" in loaded:
+                    reg = loaded
+        except Exception:
+            pass
+
+    arg_name = getattr(args, "target_name", None) or getattr(args, "target_node", None) if args else None
+    arg_host = getattr(args, "host", None) if args else None
+
+    # Allow './lamo setup 203.0.113.10' where positional target_name is actually an IP
+    if arg_name and not arg_host and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", arg_name):
+        arg_host = arg_name
+        arg_name = None
+
+    default_local_user = os.environ.get("USER", "admin")
+    if default_local_user == "root":
+        default_local_user = "admin"
+
+    print(f"\n{BOLD}{'=' * 68}{RESET}")
+    print(f" {GOLD}LAMO :: FIRST VPS ONBOARDING & AUTOMATED SETUP{RESET}")
+    print(f"{BOLD}{'=' * 68}{RESET}")
+    print(" Configure your VPS connection details once; Lamo will install your")
+    print(" SSH key and execute all 11 hardening & gateway steps automatically.\n")
+
+    host = arg_host or base_cfg.get("SERVER_IP", "")
+    if not arg_host:
+        prompt_ip = f" [{host}]" if host else ""
+        entered_ip = input(f"  1. VPS IP address or domain{prompt_ip}: ").strip()
+        if entered_ip:
+            host = entered_ip
+    if not host:
+        print(f"{RED}ERROR: VPS IP address cannot be empty.{RESET}")
+        sys.exit(1)
+
+    default_name = arg_name or base_cfg.get("SERVER_HOSTNAME")
+    if not default_name or default_name == "myserver":
+        default_name = "node-1" if not reg.get("nodes") else f"node-{len(reg['nodes']) + 1}"
+    if not arg_name:
+        entered_name = input(f"  2. Node name / hostname [{default_name}]: ").strip()
+        name = entered_name or default_name
+    else:
+        name = arg_name
+
+    arg_user = getattr(args, "user", None) if args else None
+    default_user = arg_user or base_cfg.get("ADMIN_USER") or default_local_user
+    if not arg_user:
+        entered_user = input(f"  3. Admin username to create [{default_user}]: ").strip()
+        user = entered_user or default_user
+    else:
+        user = arg_user
+
+    arg_port = getattr(args, "port", None) if args else None
+    default_port = int(arg_port or base_cfg.get("SSH_PORT", 2245))
+    if not arg_port:
+        entered_port = input(f"  4. Hardened SSH port [{default_port}]: ").strip()
+        port = int(entered_port) if entered_port.isdigit() else default_port
+    else:
+        port = int(arg_port)
+
+    arg_boot_user = getattr(args, "bootstrap_user", None) if args else None
+    default_boot_user = arg_boot_user or base_cfg.get("BOOTSTRAP_USER", "root")
+    if not arg_boot_user:
+        entered_boot_user = input(f"  5. Initial provider SSH user [{default_boot_user}]: ").strip()
+        boot_user = entered_boot_user or default_boot_user
+    else:
+        boot_user = arg_boot_user
+
+    arg_boot_port = getattr(args, "bootstrap_port", None) if args else None
+    default_boot_port = int(arg_boot_port or base_cfg.get("BOOTSTRAP_PORT", 22))
+    if not arg_boot_port:
+        entered_boot_port = input(f"  6. Initial provider SSH port [{default_boot_port}]: ").strip()
+        boot_port = int(entered_boot_port) if entered_boot_port.isdigit() else default_boot_port
+    else:
+        boot_port = int(arg_boot_port)
+
+    arg_runtime = getattr(args, "runtime", None) if args else None
+    default_runtime = (arg_runtime or base_cfg.get("CONTAINER_RUNTIME", "docker")).lower()
+    if not arg_runtime:
+        entered_rt = input(f"  7. Container engine [docker/podman] ({default_runtime}): ").strip().lower()
+        runtime = entered_rt if entered_rt in ("docker", "podman") else default_runtime
+    else:
+        runtime = default_runtime
+
+    reg.setdefault("nodes", {})[name] = {
+        "name": name,
+        "host": host,
+        "port": int(port),
+        "user": user,
+        "bootstrap_user": boot_user,
+        "bootstrap_port": int(boot_port),
+        "hostname": name,
+        "container_runtime": runtime,
+        "notes": "Primary cattle server" if len(reg["nodes"]) == 0 else "Cattle Node",
+    }
+    reg["default"] = name
+    save_nodes_registry(reg)
+
+    # Also persist inventory/config.env if no config.env exists yet
+    config_file = get_active_config_path()
+    if not config_file.exists():
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            f'SERVER_IP="{host}"\n'
+            f'BOOTSTRAP_USER="{boot_user}"\n'
+            f'BOOTSTRAP_PORT="{boot_port}"\n'
+            f'ADMIN_USER="{user}"\n'
+            f'SSH_PORT="{port}"\n'
+            f'SERVER_HOSTNAME="{name}"\n'
+            f'SWAP_SIZE_GB="{base_cfg.get("SWAP_SIZE_GB", "2")}"\n'
+            f'CONTAINER_RUNTIME="{runtime}"\n'
+        )
+
+    try:
+        rel_nodes = nodes_file.relative_to(BASE_DIR)
+    except ValueError:
+        rel_nodes = nodes_file
+    print(f"\n{GREEN}✓ Saved node '{name}' ({host}:{port}) as active default in {rel_nodes}.{RESET}\n")
+    base_cfg["SERVER_IP"] = host
+    base_cfg["ADMIN_USER"] = user
+    base_cfg["SSH_PORT"] = str(port)
+    base_cfg["BOOTSTRAP_USER"] = boot_user
+    base_cfg["BOOTSTRAP_PORT"] = str(boot_port)
+    base_cfg["SERVER_HOSTNAME"] = name
+    base_cfg["CONTAINER_RUNTIME"] = runtime
+    cfg, _ = resolve_active_node(base_cfg, name)
+    return cfg
+
+
+def cmd_setup(cfg, force=False, skip_login_check=False):
+    """Verify/bootstrap SSH login and execute all pending or changed provisioning steps automatically."""
+    if not skip_login_check:
+        if not ensure_ssh_login_and_key(cfg):
+            sys.exit(1)
+    state_script = BASE_DIR / "scripts" / "state.py"
+    cmd = [sys.executable, str(state_script), "apply"]
+    if force:
+        cmd.append("--force")
+    res = subprocess.run(cmd, cwd=BASE_DIR, env=get_node_env(cfg))
+    if res.returncode == 0:
+        print(f"\n{GREEN}✨ Node '{cfg.get('NODE_NAME')}' ({cfg['SERVER_IP']}:{cfg['SSH_PORT']}) is fully provisioned and ready!{RESET}")
+        print(f"   • Open SSH session:     {CYAN}./lamo node ssh{RESET}")
+        print(f"   • Configure Telegram:   {CYAN}./lamo telegram{RESET}")
+        print(f"   • Deploy an app:        {CYAN}./lamo app add{RESET}\n")
+    else:
+        sys.exit(res.returncode)
+
+
+def cmd_apply(cfg, force=False):
+    """Execute all provisioning steps."""
+    state_script = BASE_DIR / "scripts" / "state.py"
+    cmd = [sys.executable, str(state_script), "apply"]
+    if force:
+        cmd.append("--force")
+    subprocess.run(cmd, cwd=BASE_DIR, env=get_node_env(cfg))
+
+
+def cmd_step(cfg, step_name, force=False):
+    """Run an individual provisioning step."""
+    state_script = BASE_DIR / "scripts" / "state.py"
+    cmd = [sys.executable, str(state_script), "run", step_name]
+    if force:
+        cmd.append("--force")
+    subprocess.run(cmd, cwd=BASE_DIR, env=get_node_env(cfg))
+
+
+def cmd_update_node(cfg):
+    """Upload latest bover CLI and helper to the targeted cattle node."""
+    print(f"==> Uploading latest 'bover' CLI and helper to node {GOLD}{cfg.get('NODE_NAME')}{RESET} ({cfg['SERVER_IP']})...")
+    mux_opts = get_ssh_mux_opts(cfg)
+    scp_cmd = [
+        "scp",
+        *mux_opts,
+        "-P", str(cfg["SSH_PORT"]),
+        str(BASE_DIR / "scripts" / "bover-cli.py"),
+        f"{cfg['ADMIN_USER']}@{cfg['SERVER_IP']}:/tmp/bover-cli.py",
+    ]
+    subprocess.run(scp_cmd, check=True)
+
+    wrapper_cmd = (
+        "sudo mkdir -p /usr/local/lib/bover && "
+        "sudo cp /tmp/bover-cli.py /usr/local/lib/bover/bover_cli.py && "
+        "sudo python3 -m compileall -f -q /usr/local/lib/bover && "
+        "sudo chmod -R 755 /usr/local/lib/bover && "
+        "printf '#!/usr/bin/env python3\\nimport sys\\nsys.path.insert(0, \"/usr/local/lib/bover\")\\nfrom bover_cli import main\\nif __name__ == \"__main__\":\\n    main()\\n' | sudo tee /usr/local/bin/bover >/dev/null && "
+        "sudo chmod 755 /usr/local/bin/bover && "
+    )
+
+    helper_path = BASE_DIR / "scripts" / "bover-helper.sh"
+    if helper_path.exists():
+        scp_helper = [
+            "scp",
+            *mux_opts,
+            "-P", str(cfg["SSH_PORT"]),
+            str(helper_path),
+            f"{cfg['ADMIN_USER']}@{cfg['SERVER_IP']}:/tmp/bover-helper.sh",
+        ]
+        subprocess.run(scp_helper, check=True)
+        remote_install = (
+            wrapper_cmd +
+            "sudo cp /tmp/bover-helper.sh /usr/local/bin/bover-helper && "
+            "sudo chmod 755 /usr/local/bin/bover-helper && "
+            "sudo chown root:root /usr/local/bin/bover-helper && "
+            "sudo /usr/local/bin/bover systemd >/dev/null 2>&1 || true && "
+            "sudo rm -f /usr/local/bin/pages /usr/local/bin/lamo /usr/local/bin/appctl && "
+            "rm -f /tmp/bover-cli.py /tmp/bover-helper.sh"
+        )
+    else:
+        remote_install = (
+            wrapper_cmd +
+            "sudo /usr/local/bin/bover systemd >/dev/null 2>&1 || true && "
+            "sudo rm -f /usr/local/bin/pages /usr/local/bin/lamo /usr/local/bin/appctl && "
+            "rm -f /tmp/bover-cli.py"
+        )
+    run_ssh(cfg, remote_install)
+    print(f"{GREEN}✓ 'bover' CLI and helper successfully updated on node '{cfg.get('NODE_NAME')}'.{RESET}")
+
+
+def cmd_node_stats(cfg):
+    """Display comprehensive host system telemetry and resources for cattle node."""
+    run_ssh(cfg, "sudo -u bover bover node-stats")
+
+
+def cmd_list_nodes(base_cfg):
+    """List all configured cattle servers, connectivity status, and app counts."""
+    reg = get_nodes_registry(base_cfg)
+    default_node = reg.get("default")
+    nodes = reg.get("nodes", {})
+
+    headers = ["NODE", "HOST:PORT", "USER", "RUNTIME", "STATUS", "APPS", "ROLE"]
+    table_rows = []
+
+    for name, info in nodes.items():
+        is_default = (name == default_node)
+        display_name = f"{name} *" if is_default else name
+        host_str = f"{info['host']}:{info.get('port', 2245)}"
+        user_str = info.get("user", "admin")
+        runtime_str = info.get("container_runtime", "docker")
+
+        # Probe status
+        node_cfg = dict(base_cfg)
+        node_cfg["NODE_NAME"] = name
+        node_cfg["SERVER_IP"] = info["host"]
+        node_cfg["SSH_PORT"] = str(info.get("port", 2245))
+        node_cfg["ADMIN_USER"] = user_str
+
+        status_str = f"{RED}OFFLINE{RESET}"
+        apps_count = "-"
+        try:
+            out = run_ssh(node_cfg, "echo 'PONG'", capture=True)
+            if "PONG" in out:
+                status_str = f"{GREEN}ONLINE{RESET}"
+                apps_out = run_ssh(node_cfg, "sudo -u bover bover list 2>/dev/null", capture=True)
+                if "No services configured" in apps_out:
+                    apps_count = "0 apps"
+                elif apps_out:
+                    lines = [l for l in apps_out.splitlines() if l.strip() and not l.startswith("=")]
+                    apps_count = f"{max(0, len(lines) - 2)} apps"
+                else:
+                    apps_count = "0 apps"
+        except Exception:
+            pass
+
+        role_str = "Default Node" if is_default else info.get("notes", "Cattle Node")
+        table_rows.append([display_name, host_str, user_str, runtime_str, status_str, apps_count, role_str])
+
+    hdr_line, sep_line, row_lines = format_table(headers, table_rows)
+    w = max(len(hdr_line), 74)
+    print(f"\n{BOLD}{'=' * w}{RESET}")
+    print(f" {GOLD}ESTATE SERVERS & CATTLE NODES REGISTRY{RESET} :: L'Amo Fleet")
+    print(f"{BOLD}{'=' * w}{RESET}")
+    print(hdr_line)
+    print(sep_line)
+    for r in row_lines:
+        print(r)
+    print(f"{'-' * w}")
+    print(f"{DIM}* Default active node. Switch with 'lamo node use <name>' or target with '-n <name>'.{RESET}\n")
+
+
+def cmd_list_apps_multi(base_cfg, target_node_name=None):
+    """List applications across cattle servers, displaying the node/server column."""
+    reg = get_nodes_registry(base_cfg)
+    default_node = reg.get("default")
+    nodes = reg.get("nodes", {})
+
+    target_node_configs = {}
+    if target_node_name:
+        node_cfg, _ = resolve_active_node(base_cfg, target_node_name)
+        target_node_configs[node_cfg.get("NODE_NAME", target_node_name)] = node_cfg
+        nodes = {target_node_name: node_cfg}
+    else:
+        for node_name in nodes:
+            try:
+                cfg, _ = resolve_active_node(base_cfg, node_name)
+                target_node_configs[node_name] = cfg
+            except Exception:
+                continue
+
+    headers = ["NODE", "APP", "DOMAIN", "SLOT", "CONTAINER", "STATUS"]
+    table_rows = []
+
+    for node_name, node_cfg in target_node_configs.items():
+        is_default = (node_name == default_node)
+        display_node = f"{node_name} *" if is_default else node_name
+
+        try:
+            out = run_ssh(node_cfg, "sudo -u bover bover list", capture=True)
+            if not out or "No services configured" in out:
+                continue
+
+            for line in out.strip().splitlines():
+                parts = line.split()
+                if not parts or parts[0] in ("SERVICE", "APP") or parts[0].startswith("=") or parts[0].startswith("-"):
+                    continue
+                app_name = parts[0]
+                domain = parts[1] if len(parts) > 1 else "-"
+                slot = parts[2] if len(parts) > 2 else "-"
+                container = "-"
+                status = "-"
+                for i, p in enumerate(parts):
+                    if p.startswith(f"{app_name}-") and ("blue" in p or "green" in p):
+                        container = p
+                        status = " ".join(parts[i+1:])
+                        break
+                if container == "-":
+                    container = parts[4] if len(parts) > 4 else "-"
+                    status = " ".join(parts[5:]) if len(parts) > 5 else "running"
+
+                table_rows.append([display_node, app_name, domain, slot, container, status])
+        except Exception:
+            table_rows.append([display_node, "-", "-", "-", "-", f"{RED}[unreachable]{RESET}"])
+
+    if not table_rows:
+        hdr_line, sep_line, _ = format_table(headers, [])
+        w = max(len(hdr_line), 74)
+        print(f"\n{BOLD}{'=' * w}{RESET}")
+        print(f" {GOLD}MANAGED APPLICATIONS & DEPLOYMENT INVENTORY{RESET} :: L'Amo Fleet")
+        print(f"{BOLD}{'=' * w}{RESET}")
+        print(hdr_line)
+        print(sep_line)
+        print(" No active applications found.")
+        print(f"{'-' * w}\n")
+        return
+
+    hdr_line, sep_line, row_lines = format_table(headers, table_rows)
+    w = max(len(hdr_line), 74)
+    print(f"\n{BOLD}{'=' * w}{RESET}")
+    print(f" {GOLD}MANAGED APPLICATIONS & DEPLOYMENT INVENTORY{RESET} :: L'Amo Fleet")
+    print(f"{BOLD}{'=' * w}{RESET}")
+    print(hdr_line)
+    print(sep_line)
+    for r in row_lines:
+        print(r)
+    print(f"{'-' * w}")
+    if not target_node_name and len(nodes) > 1:
+        print(f"{DIM}* Default active node. Filter specific node with '-n <name>' or 'lamo node apps <name>'.{RESET}\n")
+    else:
+        print("")
+
+
+def cmd_node_action(base_cfg, args):
+    """Handle node management subcommands."""
+    reg = get_nodes_registry(base_cfg)
+    action = args.node_action
+
+    if action in (None, "list"):
+        cmd_list_nodes(base_cfg)
+    elif action == "status":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_name", None) or getattr(args, "target_node", None))
+        cmd_status(cfg)
+    elif action == "stats":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_name", None) or getattr(args, "target_node", None))
+        sys.exit(cmd_node_stats(cfg))
+    elif action == "apps":
+        target = getattr(args, "target_name", None) or getattr(args, "target_node", None)
+        cmd_list_apps_multi(base_cfg, target_node_name=target)
+    elif action == "ping":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_name", None) or getattr(args, "target_node", None))
+        sys.exit(cmd_ping(cfg))
+    elif action == "ssh":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+        cmd = getattr(args, "command", None)
+        if cmd:
+            run_ssh(cfg, " ".join(cmd))
+        else:
+            run_ssh(cfg, "", interactive=True)
+    elif action == "caddy":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+        caddy_act = getattr(args, "action", "status")
+        if caddy_act == "reload":
+            run_ssh(cfg, "sudo -u bover bover caddy reload")
+        elif caddy_act == "logs":
+            run_ssh(cfg, "sudo -u bover bover caddy logs", interactive=True)
+        elif caddy_act == "status":
+            run_ssh(cfg, "sudo -u bover bover caddy status")
+        elif caddy_act == "stats":
+            run_ssh(cfg, "sudo -u bover bover caddy stats")
+    elif action == "setup":
+        has_nodes = bool(reg.get("nodes")) and any(n.get("host") for n in reg.get("nodes", {}).values())
+        if getattr(args, "init", False) or getattr(args, "host", None) or (not has_nodes and not base_cfg.get("SERVER_IP")):
+            cfg = bootstrap_vps_wizard(base_cfg, args)
+        else:
+            target = getattr(args, "target_name", None) or getattr(args, "target_node", None)
+            if target and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
+                cfg = bootstrap_vps_wizard(base_cfg, args)
+            else:
+                cfg, _ = resolve_active_node(base_cfg, target)
+        cmd_setup(cfg, force=getattr(args, "force", False))
+    elif action == "apply":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+        cmd_apply(cfg, force=getattr(args, "force", False))
+    elif action == "step":
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+        cmd_step(cfg, args.name, force=getattr(args, "force", False))
+    elif action in ("update", "update-node"):
+        cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+        cmd_update_node(cfg)
+    elif action == "use":
+        target = args.target_name
+        if target not in reg.get("nodes", {}):
+            print(f"{RED}ERROR: Node '{target}' not found in registry.{RESET}")
+            sys.exit(1)
+        reg["default"] = target
+        save_nodes_registry(reg)
+        print(f"{GREEN}✓ Active default node switched to '{target}'.{RESET}")
+    elif action == "add":
+        name = getattr(args, "target_name", None)
+        host = getattr(args, "host", None)
+
+        # Interactive wizard if positional arguments are omitted
+        if not name or not host:
+            print(f"\n{BOLD}=== Register New Cattle Server Node ==={RESET}\n")
+            if not name:
+                name = input("Node identifier (e.g. worker-2): ").strip()
+                if not name:
+                    print(f"{RED}ERROR: Node name cannot be empty.{RESET}")
+                    sys.exit(1)
+            if not host:
+                host = input("Server IP address or domain: ").strip()
+                if not host:
+                    print(f"{RED}ERROR: Server IP cannot be empty.{RESET}")
+                    sys.exit(1)
+
+        user = getattr(args, "user", None)
+        if not isinstance(user, str):
+            user = base_cfg.get("ADMIN_USER", "admin")
+
+        port = getattr(args, "port", None)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = int(base_cfg.get("SSH_PORT", 2245))
+
+        bootstrap_user = getattr(args, "bootstrap_user", None)
+        if not isinstance(bootstrap_user, str):
+            bootstrap_user = base_cfg.get("BOOTSTRAP_USER", "root")
+
+        bootstrap_port = getattr(args, "bootstrap_port", None)
+        try:
+            bootstrap_port = int(bootstrap_port)
+        except (TypeError, ValueError):
+            bootstrap_port = int(base_cfg.get("BOOTSTRAP_PORT", 22))
+
+        notes = getattr(args, "notes", None)
+        if not isinstance(notes, str):
+            notes = "Cattle Node"
+
+        runtime = getattr(args, "runtime", None)
+        if not isinstance(runtime, str) or not runtime:
+            if not getattr(args, "target_name", None) or not getattr(args, "host", None):
+                runtime = input("Container runtime [docker/podman] (default: docker): ").strip().lower() or "docker"
+            else:
+                runtime = base_cfg.get("CONTAINER_RUNTIME", "docker")
+        runtime = str(runtime).lower()
+        if runtime not in ("docker", "podman"):
+            runtime = "docker"
+
+        reg["nodes"][name] = {
+            "name": name,
+            "host": host,
+            "port": int(port),
+            "user": user,
+            "bootstrap_user": bootstrap_user,
+            "bootstrap_port": int(bootstrap_port),
+            "hostname": name,
+            "container_runtime": runtime,
+            "notes": notes,
+        }
+
+        if getattr(args, "audit_retention_days", None) is not None:
+            reg["nodes"][name]["audit_retention_days"] = int(args.audit_retention_days)
+        if getattr(args, "journald_max_use_mb", None) is not None:
+            reg["nodes"][name]["journald_max_use_mb"] = int(args.journald_max_use_mb)
+        if getattr(args, "docker_log_max_size", None) is not None:
+            reg["nodes"][name]["docker_log_max_size"] = str(args.docker_log_max_size)
+        if getattr(args, "docker_log_max_files", None) is not None:
+            reg["nodes"][name]["docker_log_max_files"] = str(args.docker_log_max_files)
+
+        save_nodes_registry(reg)
+        print(f"{GREEN}✓ Node '{name}' ({host}:{port}) added to registry.{RESET}")
+        print(f"  Bootstrap: {bootstrap_user}@{host}:{bootstrap_port}")
+        print(f"  Hardened:  {user}@{host}:{port}")
+        print(f"  Runtime:   {runtime}")
+        print(f"\n💡 Run '{CYAN}./lamo -n {name} ping{RESET}' to test connectivity, then '{CYAN}./lamo -n {name} setup{RESET}' to provision.")
+    elif action == "remove":
+        name = args.target_name
+        if name not in reg.get("nodes", {}):
+            print(f"{RED}ERROR: Node '{name}' does not exist.{RESET}")
+            sys.exit(1)
+        if len(reg["nodes"]) <= 1:
+            print(f"{RED}ERROR: Cannot remove the only remaining node.{RESET}")
+            sys.exit(1)
+        del reg["nodes"][name]
+        if reg.get("default") == name:
+            reg["default"] = next(iter(reg["nodes"].keys()))
+        save_nodes_registry(reg)
+        print(f"{GREEN}✓ Node '{name}' removed from registry.{RESET}")
+
+
+def cmd_app_action(base_cfg, args):
+    """Handle application lifecycle and observability subcommands."""
+    action = getattr(args, "app_action", None)
+    if action in (None, "list"):
+        if getattr(args, "app", None):
+            cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+            app_safe = validate_app_name(args.app)
+            run_ssh(cfg, f"sudo -u bover bover status {shlex.quote(app_safe)}")
+        elif getattr(args, "target_node", None):
+            cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+            run_ssh(cfg, "sudo -u bover bover list")
+        else:
+            cmd_list_apps_multi(base_cfg, None)
+        return
+
+    cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+
+    if action == "status":
+        app_safe = validate_app_name(args.app)
+        run_ssh(cfg, f"sudo -u bover bover status {shlex.quote(app_safe)}")
+    elif action == "stats":
+        app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        run_ssh(cfg, f"sudo -u bover bover stats {app_arg}".strip())
+    elif action == "deploy":
+        name = validate_app_name(args.name)
+        no_pull = "--no-pull" if getattr(args, "no_pull", False) else ""
+        run_ssh(cfg, f"sudo -u bover bover deploy {shlex.quote(name)} {no_pull}".strip())
+    elif action == "rollback":
+        name = validate_app_name(args.name)
+        run_ssh(cfg, f"sudo -u bover bover rollback {shlex.quote(name)}")
+    elif action == "restart":
+        name = validate_app_name(args.name)
+        run_ssh(cfg, f"sudo -u bover bover restart {shlex.quote(name)}")
+    elif action == "logs":
+        name = validate_app_name(args.name)
+        follow = "-f" if getattr(args, "follow", False) else ""
+        lines = int(getattr(args, "lines", 100))
+        run_ssh(cfg, f"sudo -u bover bover logs {shlex.quote(name)} {follow} -n {lines}".strip(), interactive=getattr(args, "follow", False))
+    elif action == "config":
+        name = validate_app_name(getattr(args, "name", None) or getattr(args, "app", None))
+        json_f = "--json" if getattr(args, "json", False) else ""
+        sec_f = "--show-secrets" if getattr(args, "show_secrets", False) else ""
+        run_ssh(cfg, f"sudo -u bover bover config {shlex.quote(name)} {json_f} {sec_f}".strip())
+    elif action == "env":
+        app = validate_app_name(args.app)
+        cmd_parts = [f"sudo -u bover bover env {shlex.quote(app)}"]
+        if getattr(args, "set", None):
+            for s in args.set:
+                cmd_parts.append(f"--set {shlex.quote(s)}")
+        if getattr(args, "unset", None):
+            for u in args.unset:
+                cmd_parts.append(f"--unset {shlex.quote(u)}")
+        run_ssh(cfg, " ".join(cmd_parts))
+    elif action == "disk":
+        app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        run_ssh(cfg, f"sudo -u bover bover disk {app_arg}".strip())
+    elif action == "visits":
+        app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        run_ssh(cfg, f"sudo -u bover bover visits {app_arg}".strip())
+    elif action == "history":
+        app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        run_ssh(cfg, f"sudo -u bover bover history {app_arg}".strip())
+    elif action == "prune":
+        app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        run_ssh(cfg, f"sudo -u bover bover prune {app_arg}".strip())
+    elif action == "autodeploy":
+        run_ssh(cfg, "sudo -u bover bover autodeploy")
+    elif action == "add":
+        if args.repo and (args.domain or args.port):
+            cmd_parts = [f"sudo -u bover bover add {args.repo}"]
+            if getattr(args, "domain", None):
+                cmd_parts.append(f"--domain {args.domain}")
+            if getattr(args, "port", None):
+                cmd_parts.append(f"--port {args.port}")
+            if getattr(args, "branch", None):
+                cmd_parts.append(f"--branch {args.branch}")
+            if getattr(args, "cpu", None):
+                cmd_parts.append(f"--cpu {args.cpu}")
+            if getattr(args, "memory", None):
+                cmd_parts.append(f"--memory {shlex.quote(args.memory)}")
+            if getattr(args, "type", None) and args.type != "auto":
+                cmd_parts.append(f"--type {args.type}")
+            if getattr(args, "redirect", None):
+                cmd_parts.append(f"--redirect {shlex.quote(args.redirect)}")
+            if getattr(args, "data_dir", None):
+                cmd_parts.append(f"--data-dir {shlex.quote(args.data_dir)}")
+            run_ssh(cfg, " ".join(cmd_parts))
+        elif args.repo:
+            run_ssh(cfg, f"sudo -u bover bover add {args.repo}", interactive=True)
+        else:
+            run_ssh(cfg, "sudo -u bover bover add", interactive=True)
+    elif action in ("remove", "rm", "destroy"):
+        name = validate_app_name(args.name)
+        keep_data = "--keep-data" if getattr(args, "keep_data", False) else ""
+        force = "--force" if getattr(args, "force", False) else ""
+        run_ssh(cfg, f"sudo -u bover bover remove {shlex.quote(name)} {keep_data} {force}".strip(), interactive=not getattr(args, "force", False))
+    elif action == "backup":
+        action_or_app = getattr(args, "action_or_app", "all")
+        app_names = getattr(args, "app_names", []) or []
+        if action_or_app == "config":
+            run_ssh(cfg, "sudo -u bover bover backup config", interactive=True)
+        elif action_or_app in ("all", "run-all"):
+            run_ssh(cfg, "sudo -u bover bover backup all")
+        elif action_or_app == "run":
+            if not app_names:
+                print("Error: Application name required for 'backup run <app...>'")
+                sys.exit(1)
+            safe_apps = [shlex.quote(validate_app_name(a)) for a in app_names]
+            run_ssh(cfg, f"sudo -u bover bover backup run {' '.join(safe_apps)}")
+        else:
+            all_apps = [action_or_app] + app_names
+            safe_apps = [shlex.quote(validate_app_name(a)) for a in all_apps]
+            run_ssh(cfg, f"sudo -u bover bover backup run {' '.join(safe_apps)}")
+    elif action in ("cron", "crons"):
+        c_act = getattr(args, "cron_action", None)
+        if c_act in (None, "list", "ls"):
+            app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+            run_ssh(cfg, f"sudo -u bover bover cron list {app_arg}".strip())
+        elif c_act == "add":
+            app_safe = shlex.quote(validate_app_name(args.app))
+            job_safe = shlex.quote(validate_cron_id(args.job_id))
+            sched_safe = shlex.quote(args.schedule)
+            cmd_safe = shlex.quote(args.job_command)
+            mode_val = shlex.quote(getattr(args, "mode", "exec") or "exec")
+            timeout_val = int(getattr(args, "timeout", 3600) or 3600)
+            notify_val = shlex.quote(getattr(args, "notify", "on_failure") or "on_failure")
+            parts = [
+                f"sudo -u bover bover cron add {app_safe} {job_safe} {sched_safe} {cmd_safe}",
+                f"--mode {mode_val}",
+                f"--timeout {timeout_val}",
+                f"--notify {notify_val}",
+            ]
+            if getattr(args, "description", None):
+                parts.append(f"--description {shlex.quote(args.description)}")
+            if getattr(args, "overlap", False):
+                parts.append("--overlap")
+            run_ssh(cfg, " ".join(parts))
+        elif c_act in ("remove", "rm", "delete"):
+            app_safe = shlex.quote(validate_app_name(args.app))
+            job_safe = shlex.quote(validate_cron_id(args.job_id))
+            run_ssh(cfg, f"sudo -u bover bover cron remove {app_safe} {job_safe}")
+        elif c_act == "enable":
+            app_safe = shlex.quote(validate_app_name(args.app))
+            job_safe = shlex.quote(validate_cron_id(args.job_id))
+            run_ssh(cfg, f"sudo -u bover bover cron enable {app_safe} {job_safe}")
+        elif c_act == "disable":
+            app_safe = shlex.quote(validate_app_name(args.app))
+            job_safe = shlex.quote(validate_cron_id(args.job_id))
+            run_ssh(cfg, f"sudo -u bover bover cron disable {app_safe} {job_safe}")
+        elif c_act == "run":
+            app_safe = shlex.quote(validate_app_name(args.app))
+            job_safe = shlex.quote(validate_cron_id(args.job_id))
+            run_ssh(cfg, f"sudo -u bover bover cron run {app_safe} {job_safe}")
+        elif c_act in ("history", "logs", "runs"):
+            app_arg = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+            job_opt = f"--job {shlex.quote(validate_cron_id(args.job_id))}" if getattr(args, "job_id", None) else ""
+            limit_val = int(getattr(args, "limit", 25) or 25)
+            run_ssh(cfg, f"sudo -u bover bover cron history {app_arg} {job_opt} -n {limit_val}".strip())
+        elif c_act in ("show", "output", "inspect"):
+            run_id = int(args.run_id)
+            run_ssh(cfg, f"sudo -u bover bover cron show {run_id}")
+
+
+def cmd_telegram(base_cfg, args):
+    """Handle Telegram notification testing and custom dispatch."""
+    cfg, _ = resolve_active_node(base_cfg, getattr(args, "target_node", None))
+    action = getattr(args, "action", None)
+    if getattr(args, "token", None) and getattr(args, "chat_id", None):
+        run_ssh(cfg, f"sudo -u bover bover telegram --token {shlex.quote(args.token)} --chat-id {shlex.quote(args.chat_id)} --test")
+    elif getattr(args, "send", None) or action == "send":
+        msg = getattr(args, "send", None) or getattr(args, "message", None) or "Test alert from lamo"
+        run_ssh(cfg, f"sudo -u bover bover telegram --send {shlex.quote(msg)}")
+    elif getattr(args, "test", False) or action == "test":
+        run_ssh(cfg, "sudo -u bover bover telegram --test")
+    else:
+        run_ssh(cfg, "sudo -u bover bover telegram", interactive=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="lamo",
+        description="Lamo (L'Amo) - Local Multi-Server Infrastructure & Application Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  lamo node                      # List all server nodes and status
+  lamo node status               # Inspect server provisioning state
+  lamo node stats                # Display host system telemetry (CPU, RAM, Disk, Docker)
+  lamo node setup                # Run pending provisioning steps on node
+  lamo node apps node-1          # List applications running on specific node
+  lamo node ssh                  # Open interactive SSH session
+  lamo app list                  # List all applications across fleet
+  lamo app status myapp          # Live container health check & HTTP probe
+  lamo app stats myapp           # Container CPU/RAM & historical differential stats
+  lamo app deploy myapp          # Zero-downtime deployment with git pull
+  lamo app rollback myapp        # Instant rollback to previous slot
+  lamo app logs myapp -f         # Stream live container logs
+  lamo app config myapp          # Inspect app routing, slots and configuration
+  lamo app disk                  # Display disk footprints and growth differentials
+  lamo app visits                # Display Caddy HTTP requests and analytics
+""",
+    )
+
+    parser.add_argument(
+        "--node", "-n", "--server", "-s",
+        dest="target_node",
+        help="Target a specific cattle server node (default: active node from nodes.json)",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="subcommand",
+        metavar="{setup,node,app,telegram}",
+        help="Command to execute",
+    )
+
+    # 0. Top-level 'lamo setup' (First VPS Onboarding + Login + Automated Provisioning)
+    top_setup_p = subparsers.add_parser(
+        "setup",
+        help="Onboard first/new VPS, install SSH key login, and run full automated setup",
+    )
+    top_setup_p.add_argument("target_name", nargs="?", help="Optional node name or VPS IP address")
+    top_setup_p.add_argument("host", nargs="?", help="Optional VPS IP address or domain")
+    top_setup_p.add_argument("--init", "--new", dest="init", action="store_true", help="Launch interactive wizard to configure/register a VPS before provisioning")
+    top_setup_p.add_argument("--port", "-p", type=int, default=None, help="Hardened SSH port (default: 2245)")
+    top_setup_p.add_argument("--user", "-u", default=None, help="Hardened admin SSH user to create")
+    top_setup_p.add_argument("--bootstrap-user", default=None, help="Initial provider SSH user (default: root)")
+    top_setup_p.add_argument("--bootstrap-port", type=int, default=None, help="Initial provider SSH port (default: 22)")
+    top_setup_p.add_argument("--runtime", "--container-runtime", choices=["docker", "podman"], default=None, help="Container engine runtime (default: docker)")
+    top_setup_p.add_argument("--force", "-f", action="store_true", help="Force re-running all provisioning steps")
+
+    # 1. Multi-Server & Node Management
+    node_p = subparsers.add_parser(
+        "node",
+        aliases=["nodes", "server", "servers"],
+        help="Manage server nodes (status, stats, setup, apply, step, ping, ssh, caddy, add, rm)",
+    )
+    node_sub = node_p.add_subparsers(dest="node_action", help="Node action")
+    node_sub.add_parser("list", aliases=["ls"], help="List all registered cattle server nodes")
+    n_status_p = node_sub.add_parser("status", help="Inspect node provisioning state & checksums")
+    n_status_p.add_argument("target_name", nargs="?", help="Optional node name (default: active node)")
+    n_stats_p = node_sub.add_parser("stats", help="Display host system telemetry (CPU, RAM, Disk, Uptime, Docker)")
+    n_stats_p.add_argument("target_name", nargs="?", help="Optional node name (default: active node)")
+    n_apps_p = node_sub.add_parser("apps", help="List applications running on a specific node")
+    n_apps_p.add_argument("target_name", nargs="?", help="Optional node name (default: active node)")
+    n_ping_p = node_sub.add_parser("ping", help="Test node SSH connectivity")
+    n_ping_p.add_argument("target_name", nargs="?", help="Optional node name (default: active node)")
+    n_ssh_p = node_sub.add_parser("ssh", help="Open SSH session or execute command on node")
+    n_ssh_p.add_argument("command", nargs=argparse.REMAINDER, help="Remote command to execute (optional)")
+    n_setup_p = node_sub.add_parser("setup", help="Run pending or changed provisioning steps on node")
+    n_setup_p.add_argument("target_name", nargs="?", help="Optional node name or VPS IP address")
+    n_setup_p.add_argument("host", nargs="?", help="Optional VPS IP address or domain")
+    n_setup_p.add_argument("--init", "--new", dest="init", action="store_true", help="Launch interactive wizard to configure/register a VPS")
+    n_setup_p.add_argument("--port", "-p", type=int, default=None, help="Hardened SSH port (default: 2245)")
+    n_setup_p.add_argument("--user", "-u", default=None, help="Hardened admin SSH user")
+    n_setup_p.add_argument("--bootstrap-user", default=None, help="Initial provider SSH user (default: root)")
+    n_setup_p.add_argument("--bootstrap-port", type=int, default=None, help="Initial provider SSH port (default: 22)")
+    n_setup_p.add_argument("--runtime", "--container-runtime", choices=["docker", "podman"], default=None, help="Container engine runtime (default: docker)")
+    n_setup_p.add_argument("--force", "-f", action="store_true", help="Force execution even if checksum matches")
+    n_apply_p = node_sub.add_parser("apply", help="Execute all provisioning steps")
+    n_apply_p.add_argument("--force", "-f", action="store_true", help="Force execution")
+    n_step_p = node_sub.add_parser("step", help="Run an individual provisioning step on node")
+    n_step_p.add_argument("name", help="Step name (e.g. step-swap, step-cis, step-gateway)")
+    n_step_p.add_argument("--force", "-f", action="store_true", help="Force execution")
+    node_sub.add_parser("update", aliases=["update-node"], help="Push latest 'bover' CLI and gateway templates to node")
+    n_caddy_p = node_sub.add_parser("caddy", help="Manage central Caddy reverse proxy gateway")
+    n_caddy_p.add_argument("action", choices=["status", "stats", "reload", "logs"], default="status", nargs="?")
+    use_p = node_sub.add_parser("use", help="Switch default active server node")
+    use_p.add_argument("target_name", help="Node name to make active")
+    add_node_p = node_sub.add_parser("add", help="Register a new cattle server node")
+    add_node_p.add_argument("target_name", nargs="?", help="Name for the new server node")
+    add_node_p.add_argument("host", nargs="?", help="IP address or domain of the node")
+    add_node_p.add_argument("--port", "-p", type=int, default=None, help="Hardened SSH port (default: 2245)")
+    add_node_p.add_argument("--user", "-u", default=None, help="Hardened admin SSH user (default: from config or admin)")
+    add_node_p.add_argument("--bootstrap-user", default=None, help="Initial bootstrap user before hardening (default: root)")
+    add_node_p.add_argument("--bootstrap-port", type=int, default=None, help="Initial bootstrap port before hardening (default: 22)")
+    add_node_p.add_argument("--notes", help="Optional description")
+    add_node_p.add_argument("--runtime", "--container-runtime", choices=["docker", "podman"], default=None, help="Container engine runtime (default: docker)")
+    add_node_p.add_argument("--audit-retention-days", type=int, default=None, help="User session command & auth log retention in days (default: 7)")
+    add_node_p.add_argument("--journald-max-use-mb", type=int, default=None, help="Systemd journal max disk usage in MB (default: 150)")
+    add_node_p.add_argument("--docker-log-max-size", default=None, help="Docker container log max file size (default: 10m)")
+    add_node_p.add_argument("--docker-log-max-files", default=None, help="Docker container log max rotated files (default: 3)")
+    rm_node_p = node_sub.add_parser("remove", aliases=["rm"], help="Remove a cattle server from registry")
+    rm_node_p.add_argument("target_name", help="Node name to remove")
+
+    # 2. Application Management Namespace
+    app_p = subparsers.add_parser(
+        "app",
+        aliases=["apps"],
+        help="Manage applications (list, status, stats, deploy, rollback, restart, logs, config, env...)",
+    )
+    app_sub = app_p.add_subparsers(dest="app_action", help="Application action")
+    al_p = app_sub.add_parser("list", aliases=["ls"], help="List all applications across nodes (with server/node column)")
+    al_p.add_argument("app", nargs="?", default=None, help="Optional specific app to inspect")
+    as_p = app_sub.add_parser("status", help="Inspect live application health, HTTP response & routing state")
+    as_p.add_argument("app", help="Application name to inspect")
+    ast_p = app_sub.add_parser("stats", help="Display container CPU & Memory metrics")
+    ast_p.add_argument("app", nargs="?", help="Specific app name (optional)")
+    ad_p = app_sub.add_parser("deploy", help="Deploy app with zero-downtime Blue/Green strategy")
+    ad_p.add_argument("name", help="Application name")
+    ad_p.add_argument("--no-pull", action="store_true", help="Deploy without pulling latest git commit")
+    ar_p = app_sub.add_parser("rollback", help="Instant rollback to previous deployment slot")
+    ar_p.add_argument("name", help="Application name")
+    ars_p = app_sub.add_parser("restart", help="Restart app with zero-downtime")
+    ars_p.add_argument("name", help="Application name")
+    alogs_p = app_sub.add_parser("logs", help="Tail live logs for an app")
+    alogs_p.add_argument("name", help="Application name")
+    alogs_p.add_argument("-f", "--follow", action="store_true", help="Follow log output")
+    alogs_p.add_argument("-n", "--lines", type=int, default=100, help="Number of lines to show")
+    aenv_p = app_sub.add_parser("env", help="Manage application secrets and environment variables")
+    aenv_p.add_argument("app", nargs="?", default="shared", help="App name or 'shared' (default: shared)")
+    aenv_p.add_argument("--set", "-s", metavar="KEY=VAL", action="append", help="Set environment variable")
+    aenv_p.add_argument("--unset", "-u", metavar="KEY", action="append", help="Unset environment variable")
+    adisk_p = app_sub.add_parser("disk", help="Display disk footprints and growth differentials")
+    adisk_p.add_argument("app", nargs="?", help="Specific app name (optional)")
+    avis_p = app_sub.add_parser("visits", help="Display Caddy HTTP requests and analytics")
+    avis_p.add_argument("app", nargs="?", help="Specific app name (optional)")
+    ahist_p = app_sub.add_parser("history", help="Show deployment and rollback audit history")
+    ahist_p.add_argument("app", nargs="?", help="Specific app name (optional)")
+    abk_p = app_sub.add_parser("backup", help="Manage automated Cloudflare R2 / S3 backups")
+    abk_p.add_argument("action_or_app", nargs="?", default="all", help="'config', 'all', 'run', or application name(s)")
+    abk_p.add_argument("app_names", nargs="*", default=[], help="Application name(s)")
+    aprune_p = app_sub.add_parser("prune", help="Enforce version retention lifecycle and prune old images")
+    aprune_p.add_argument("app", nargs="?", help="Specific app name (optional)")
+    app_sub.add_parser("autodeploy", help="Poll remote git repos and auto-deploy new commits")
+    aadd_p = app_sub.add_parser("add", help="Add an application (interactive wizard or flag-based)")
+    aadd_p.add_argument("repo", nargs="?", help="Git repository URL or service name")
+    aadd_p.add_argument("--domain", "-d", help="Domain or subdomain")
+    aadd_p.add_argument("--port", "-p", type=int, help="Internal container port")
+    aadd_p.add_argument("--branch", "-b", help="Git branch")
+    aadd_p.add_argument("--cpu", type=float, default=0.5, help="Maximum CPU limit (default: 0.5)")
+    aadd_p.add_argument("--memory", "-m", default="512m", help="Maximum RAM limit (default: 512m)")
+    aadd_p.add_argument("--type", choices=["auto", "dockerfile", "compose"], default="auto", help="Build type (default: auto)")
+    aadd_p.add_argument("--redirect", "--redirects", help="Domain(s) to redirect permanently to primary domain")
+    aadd_p.add_argument("--data-dir", help="Custom host storage directory")
+    arm_p = app_sub.add_parser("remove", aliases=["rm", "destroy"], help="Decommission and remove an application")
+    arm_p.add_argument("name", help="Application name")
+    arm_p.add_argument("--keep-data", action="store_true", help="Preserve persistent data directory (/data)")
+    arm_p.add_argument("--force", "-f", action="store_true", help="Force remove without interactive confirmation")
+    acfg_p = app_sub.add_parser("config", help="Display full app configuration, secrets and routing")
+    acfg_p.add_argument("name", help="Application name")
+    acfg_p.add_argument("--json", action="store_true", help="Output raw JSON configuration")
+    acfg_p.add_argument("--show-secrets", action="store_true", help="Display unmasked environment secrets")
+
+    def _register_cron_subparsers(cron_parser):
+        c_sub = cron_parser.add_subparsers(dest="cron_action", help="Cron action")
+        c_ls = c_sub.add_parser("list", aliases=["ls"], help="List configured cron jobs and last execution status")
+        c_ls.add_argument("app", nargs="?", default=None, help="Optional application name")
+
+        c_add = c_sub.add_parser("add", help="Add or update a scheduled cron job for an application")
+        c_add.add_argument("app", help="Application name")
+        c_add.add_argument("job_id", help="Unique cron job identifier (e.g. daily-cleanup)")
+        c_add.add_argument("schedule", help="5-field cron schedule (e.g. '0 3 * * *') or macro (@daily, @hourly, @every 5m)")
+        c_add.add_argument("job_command", help="Command to execute inside container")
+        c_add.add_argument("--mode", choices=["exec", "run"], default="exec", help="Execution mode: 'exec' (active container) or 'run' (ephemeral isolated container)")
+        c_add.add_argument("--timeout", type=int, default=3600, help="Maximum execution timeout in seconds (default: 3600)")
+        c_add.add_argument("--notify", choices=["on_failure", "always", "never"], default="on_failure", help="Telegram notification policy (default: on_failure)")
+        c_add.add_argument("--description", default="", help="Optional description for the cron job")
+        c_add.add_argument("--overlap", action="store_true", help="Allow overlapping concurrent executions")
+
+        c_rm = c_sub.add_parser("remove", aliases=["rm", "delete"], help="Remove a cron job from an application")
+        c_rm.add_argument("app", help="Application name")
+        c_rm.add_argument("job_id", help="Cron job ID to remove")
+
+        c_en = c_sub.add_parser("enable", help="Enable a cron job")
+        c_en.add_argument("app", help="Application name")
+        c_en.add_argument("job_id", help="Cron job ID to enable")
+
+        c_dis = c_sub.add_parser("disable", help="Disable/pause a cron job")
+        c_dis.add_argument("app", help="Application name")
+        c_dis.add_argument("job_id", help="Cron job ID to disable")
+
+        c_run = c_sub.add_parser("run", help="Manually trigger a cron job immediately and inspect output")
+        c_run.add_argument("app", help="Application name")
+        c_run.add_argument("job_id", help="Cron job ID to execute now")
+
+        c_hist = c_sub.add_parser("history", aliases=["logs", "runs"], help="Show cron execution audit history, status & durations")
+        c_hist.add_argument("app", nargs="?", default=None, help="Optional application name")
+        c_hist.add_argument("--job", "-j", dest="job_id", default=None, help="Filter by specific cron job ID")
+        c_hist.add_argument("-n", "--limit", type=int, default=25, help="Number of execution records to show (default: 25)")
+
+        c_show = c_sub.add_parser("show", aliases=["output", "inspect"], help="Inspect full details and stdout/stderr of a cron execution")
+        c_show.add_argument("run_id", type=int, help="Execution run ID (#)")
+
+    acron_p = app_sub.add_parser("cron", aliases=["crons"], help="Manage per-project scheduled cron jobs & execution history")
+    _register_cron_subparsers(acron_p)
+
+    # 3. Telegram Notifications
+    tg_p = subparsers.add_parser("telegram", help="Configure or test Telegram deployment notifications")
+    tg_p.add_argument("action", choices=["test", "send", "config"], nargs="?", default=None, help="Action ('test', 'send', 'config')")
+    tg_p.add_argument("message", nargs="?", default=None, help="Custom message for 'send' action")
+    tg_p.add_argument("--token", help="Telegram Bot Token")
+    tg_p.add_argument("--chat-id", help="Telegram Chat ID")
+    tg_p.add_argument("--test", action="store_true", help="Send a test notification")
+    tg_p.add_argument("--send", help="Send a custom alert notification to Telegram")
+
+    args = parser.parse_args()
+
+    if not args.subcommand:
+        parser.print_help()
+        sys.exit(0)
+
+    sub = args.subcommand
+    allow_empty_cfg = (
+        sub == "setup"
+        or (sub in ("node", "nodes", "server", "servers") and getattr(args, "node_action", None) in ("setup", "add"))
+    )
+    base_cfg = load_base_config(allow_empty=allow_empty_cfg)
+
+    if sub == "setup":
+        args.node_action = "setup"
+        cmd_node_action(base_cfg, args)
+        return
+    elif sub in ("node", "nodes", "server", "servers"):
+        cmd_node_action(base_cfg, args)
+        return
+    elif sub in ("app", "apps"):
+        cmd_app_action(base_cfg, args)
+        return
+    elif sub == "telegram":
+        cmd_telegram(base_cfg, args)
+        return
+
+
+if __name__ == "__main__":
+    main()

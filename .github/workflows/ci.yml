@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-verify:
+    name: Unit Tests & Syntax Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify Python syntax compilation
+        run: |
+          python3 -m py_compile lamo scripts/bover-cli.py scripts/state.py scripts/generate_branding.py
+
+      - name: Verify Bash scripts syntax
+        run: |
+          bash -n scripts/*.sh
+
+      - name: Run unit test suite
+        run: |
+          make test

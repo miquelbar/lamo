@@ -34,7 +34,7 @@ import signal
 import http.client
 import tempfile
 import tarfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Union
@@ -4765,6 +4765,131 @@ def cmd_backup_list(app_name: Optional[str] = None):
     print(f"\n💡 Run './lamo app backup verify <app>' to test recovery integrity of the latest backup.\n")
 
 
+def parse_backup_timestamp(filename: str, file_path: Optional[Path] = None) -> datetime:
+    """Extract timestamp from backup filename or fallback to file modification time."""
+    # Pattern 1: backup_<app>_YYYY-MM-DD_HH-MM-SS.tar.gz
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})", filename)
+    if m:
+        try:
+            return datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                tzinfo=timezone.utc
+            )
+        except Exception:
+            pass
+    # Pattern 2: <app>-pre-decommission-YYYYMMDD-HHMMSS.tar.gz
+    m2 = re.search(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})", filename)
+    if m2:
+        try:
+            return datetime(
+                int(m2.group(1)), int(m2.group(2)), int(m2.group(3)),
+                int(m2.group(4)), int(m2.group(5)), int(m2.group(6)),
+                tzinfo=timezone.utc
+            )
+        except Exception:
+            pass
+    if file_path and file_path.exists():
+        try:
+            return datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def rotate_local_backups(app_name: str, keep_days: int = 5) -> Tuple[int, int]:
+    """
+    Rotate and prune local backup archives stored on disk for an application.
+    Enforces retention window (default: 5 days) while always guaranteeing at least
+    the newest backup is preserved. Returns (pruned_count, freed_bytes).
+    """
+    validate_app_name(app_name)
+    backups_base = APPS_DIR / "backups"
+    app_backup_dir = backups_base / app_name
+
+    candidates: List[Tuple[Path, datetime, int]] = []
+
+    # 1. Inspect app-specific backup folder
+    if app_backup_dir.exists():
+        for p in app_backup_dir.glob("*.tar.gz"):
+            ts = parse_backup_timestamp(p.name, p)
+            candidates.append((p, ts, p.stat().st_size))
+
+    # 2. Inspect root backups folder for pre-decommission archives
+    if backups_base.exists():
+        for p in backups_base.glob(f"{app_name}-pre-decommission-*.tar.gz"):
+            ts = parse_backup_timestamp(p.name, p)
+            candidates.append((p, ts, p.stat().st_size))
+
+    if not candidates:
+        return 0, 0
+
+    # Sort descending by timestamp (newest first)
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=keep_days)
+
+    pruned_count = 0
+    freed_bytes = 0
+
+    # Always preserve candidates[0] (the newest backup) so an app never loses its only backup
+    for p, ts, size in candidates[1:]:
+        if ts < cutoff:
+            try:
+                p.unlink(missing_ok=True)
+                pruned_count += 1
+                freed_bytes += size
+            except Exception as e:
+                print(f"Warning: Failed to prune local backup {p}: {e}")
+
+    return pruned_count, freed_bytes
+
+
+def rotate_all_local_backups(keep_days: int = 5) -> Tuple[int, int]:
+    """Prune old local backups for all applications and legacy archives in /opt/apps/backups/."""
+    backups_base = APPS_DIR / "backups"
+    if not backups_base.exists():
+        return 0, 0
+
+    total_pruned = 0
+    total_freed = 0
+
+    # Rotate per app directory
+    for item in backups_base.iterdir():
+        if item.is_dir():
+            pruned, freed = rotate_local_backups(item.name, keep_days=keep_days)
+            total_pruned += pruned
+            total_freed += freed
+
+    # Also clean orphaned root archives older than keep_days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    for p in backups_base.glob("*.tar.gz"):
+        ts = parse_backup_timestamp(p.name, p)
+        if ts < cutoff:
+            try:
+                size = p.stat().st_size
+                p.unlink(missing_ok=True)
+                total_pruned += 1
+                total_freed += size
+            except Exception:
+                pass
+
+    return total_pruned, total_freed
+
+
+def cmd_backup_prune(app_name: Optional[str] = None, keep_days: int = 5):
+    """CLI handler to manually or automatically prune local backups on disk."""
+    print(f"==> Pruning local backup archives older than {keep_days} days on disk...")
+    if app_name:
+        validate_app_name(app_name)
+        pruned, freed = rotate_local_backups(app_name, keep_days=keep_days)
+        print(f"✓ Pruned {pruned} old local backup archive(s) for '{app_name}' (freed {format_bytes(freed)}, retaining last {keep_days} days).")
+    else:
+        pruned, freed = rotate_all_local_backups(keep_days=keep_days)
+        print(f"✓ Pruned {pruned} old local backup archive(s) across all applications (freed {format_bytes(freed)}, retaining last {keep_days} days).")
+
+
 def notify_backup_result(app_name: str, success: bool, destination_key: Optional[str] = None, file_size_bytes: int = 0, error: Optional[str] = None, duration: float = 0.0, integrity_summary: Optional[str] = None):
     """Notify operator via Telegram with Es Bover avatar."""
     hostname = run_cmd("hostname", capture=True) or "server"
@@ -4930,11 +5055,30 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
             )
 
         if success:
+            # Store local rolling copy for instant offline restore
+            local_backup_dir = APPS_DIR / "backups" / app_name
+            try:
+                local_backup_dir.mkdir(parents=True, exist_ok=True)
+                local_dest = local_backup_dir / tar_path.name
+                shutil.copy2(tar_path, local_dest)
+                try:
+                    os.chmod(local_dest, 0o640)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Warning: Failed to save local backup copy: {e}")
+
+            # Enforce local disk rotation (default: retain last 5 days)
+            retention_days = int(cfg.get("backup_retention_days") or cfg.get("keep_local_backups_days") or 5)
+            pruned_count, freed_bytes = rotate_local_backups(app_name, keep_days=retention_days)
+
             db_report_str = ""
             if verified_databases:
                 db_names = ", ".join(f"{d['filename']}: ok ({d['total_tables']} tables, {d['total_records']} rows)" for d in verified_databases)
-                db_report_str = f"\n  • Integrity: 🟢 Verified ({db_names})"
+                db_report_str = f"\n  • Integrity:     🟢 Verified ({db_names})"
+            local_rot_str = f" · rotated: {pruned_count} old file(s) pruned, {format_bytes(freed_bytes)} freed" if pruned_count > 0 else ""
             print(f"✓ Backup for '{app_name}' completed in {duration:.1f}s: r2://{s3_cfg['bucket']}/{r2_key} ({format_bytes(file_size)}){db_report_str}")
+            print(f"  • Local Storage: 🟢 Retained in backups/{app_name}/ (retention: last {retention_days} days{local_rot_str})")
             return True, r2_key, file_size, duration
         else:
             print(f"ERROR: Backup upload failed for '{app_name}': {err}")
@@ -5065,6 +5209,8 @@ def backup_all():
 
     print(f"==> Starting automated backup batch for {len(apps_to_backup)} application(s): {', '.join(apps_to_backup)}")
     run_backups_batch(apps_to_backup)
+    # Ensure local backup storage is cleanly rotated (retaining last 5 days)
+    rotate_all_local_backups(keep_days=5)
 
 
 # ==============================================================================
@@ -6141,6 +6287,10 @@ def main():
     bk_ver_p.add_argument("--key", default=None, help="Specific R2 key to verify (defaults to latest)")
     bk_ver_p.add_argument("--file", default=None, help="Local backup tar.gz file to verify instead of downloading from R2")
 
+    bk_prune_p = bk_sub.add_parser("prune", help="Rotate and prune local backup archives on disk (default: retain last 5 days)")
+    bk_prune_p.add_argument("app", nargs="?", default=None, help="Optional application name")
+    bk_prune_p.add_argument("--days", type=int, default=5, help="Number of days of local backups to retain (default: 5)")
+
     # cron
     cron_p = subparsers.add_parser("cron", aliases=["crons"], help="Manage per-project scheduled cron jobs & execution history")
     cron_sub = cron_p.add_subparsers(dest="cron_action", help="Cron action")
@@ -6354,6 +6504,8 @@ def main():
             )
             if not ok:
                 sys.exit(1)
+        elif args.backup_action in ("prune", "rotate", "clean"):
+            cmd_backup_prune(getattr(args, "app", None), keep_days=getattr(args, "days", 5))
         else:
             bk_p.print_help()
     elif args.command in ("cron", "crons"):

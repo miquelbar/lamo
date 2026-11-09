@@ -1138,6 +1138,10 @@ def cmd_app_action(base_cfg, args):
             target_app = shlex.quote(validate_app_name(app_names[0]))
             key_arg = f"--key {shlex.quote(args.key)}" if getattr(args, "key", None) else ""
             run_ssh(cfg, f"sudo -u bover bover backup verify {target_app} {key_arg}".strip())
+        elif action_or_app in ("prune", "rotate", "clean"):
+            target_app = shlex.quote(validate_app_name(app_names[0])) if app_names else ""
+            days_arg = f"--days {getattr(args, 'days', 5)}" if getattr(args, "days", None) else ""
+            run_ssh(cfg, f"sudo -u bover bover backup prune {target_app} {days_arg}".strip())
         elif action_or_app == "run":
             if not app_names:
                 print("Error: Application name required for 'backup run <app...>'")
@@ -1357,6 +1361,7 @@ Examples:
     abk_p.add_argument("action_or_app", nargs="?", default="all", help="'config', 'all', 'list', 'verify', 'run', or application name(s)")
     abk_p.add_argument("app_names", nargs="*", default=[], help="Application name(s)")
     abk_p.add_argument("--key", default=None, help="Specific R2 key to verify with 'backup verify'")
+    abk_p.add_argument("--days", type=int, default=5, help="Retention window in days for 'backup prune' (default: 5)")
     aprune_p = app_sub.add_parser("prune", help="Enforce version retention lifecycle and prune old images")
     aprune_p.add_argument("app", nargs="?", help="Specific app name (optional)")
     app_sub.add_parser("autodeploy", help="Poll remote git repos and auto-deploy new commits")

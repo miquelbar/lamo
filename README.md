@@ -629,6 +629,21 @@ What `verify` tests:
 4. **Relational Constraints:** Executes `PRAGMA foreign_key_check;` to verify relational consistency.
 5. **Schema & Table Record Breakdown:** Queries `sqlite_master` and counts rows across all application tables.
 
+### D. Local Rolling Retention & Disk Protection (`prune`)
+To prevent backups from accumulating indefinitely and exhausting VPS disk space:
+* **Off-Site vs Local Storage:** Cloudflare R2 retains the remote archives. A rolling copy of recent backups is kept on the VPS in `/opt/apps/backups/<app>/` for instant recovery without network round-trips.
+* **Automatic Rotation (Default: 5 Days):** Every backup run automatically rotates the local archive folder, removing files older than 5 days (`keep_local_backups_days`).
+* **Safety Lock:** The rotation engine guarantees that at least the most recent backup is always preserved on disk, even if all backups exceed the retention threshold.
+* **On-Demand Pruning:** You can manually prune local backups across all apps or for a specific app:
+
+```bash
+# Rotate local backups for all applications retaining the last 5 days
+./lamo app backup prune
+
+# Rotate with a custom retention window (e.g. 3 days) for a specific app
+./lamo app backup prune horify --days 3
+```
+
 ---
 
 ## 16. Cinematic Visual Identity Suite (`assets/`)
@@ -705,6 +720,7 @@ make test
 ./lamo app backup run <app>      # Trigger immediate backup for specific app(s)
 ./lamo app backup list [app]     # List remote backup archives stored in Cloudflare R2
 ./lamo app backup verify <app>   # Deep integrity test (SQLite PRAGMA, schema, secrets & files)
+./lamo app backup prune [app]    # Rotate and prune local backups on disk (default: 5 days)
 ./lamo app backup config         # Configure Cloudflare R2 / S3 vault credentials
 ./lamo app prune                 # Enforce version retention lifecycle and prune old images
 ./lamo app autodeploy            # Poll remote git repos and auto-deploy new commits
@@ -716,6 +732,6 @@ make test
 ./lamo telegram test             # Dispatch a test notification alert
 
 # Local Development & Testing
-make test                        # Run automated unit test suite (48 tests)
+make test                        # Run automated unit test suite (49 tests)
 make clean                       # Clean bytecode, pycache and temporary files
 ```

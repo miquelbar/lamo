@@ -656,6 +656,36 @@ class TestBoverVaultAndIsolation(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(data, b"GZIP_TAR_MOCK_DATA")
 
+    def test_rotate_local_backups_retention_window(self):
+        from datetime import datetime, timezone, timedelta
+        app_name = "testapp"
+        backups_dir = self.apps_dir / "backups" / app_name
+        backups_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        f_recent = backups_dir / f"backup_{app_name}_{(now - timedelta(days=1)).strftime('%Y-%m-%d_%H-%M-%S')}.tar.gz"
+        f_within = backups_dir / f"backup_{app_name}_{(now - timedelta(days=3)).strftime('%Y-%m-%d_%H-%M-%S')}.tar.gz"
+        f_old1 = backups_dir / f"backup_{app_name}_{(now - timedelta(days=10)).strftime('%Y-%m-%d_%H-%M-%S')}.tar.gz"
+        f_old2 = backups_dir / f"backup_{app_name}_{(now - timedelta(days=30)).strftime('%Y-%m-%d_%H-%M-%S')}.tar.gz"
+
+        for f in (f_recent, f_within, f_old1, f_old2):
+            f.write_bytes(b"dummy backup data")
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir):
+            pruned, freed = bover_mod.rotate_local_backups(app_name, keep_days=5)
+            self.assertEqual(pruned, 2)
+            self.assertGreater(freed, 0)
+            self.assertTrue(f_recent.exists())
+            self.assertTrue(f_within.exists())
+            self.assertFalse(f_old1.exists())
+            self.assertFalse(f_old2.exists())
+
+            # Test safety: if all remaining backups are old, newest is still preserved
+            pruned2, _ = bover_mod.rotate_local_backups(app_name, keep_days=0)
+            self.assertEqual(pruned2, 1)
+            self.assertTrue(f_recent.exists())
+            self.assertFalse(f_within.exists())
+
 
 class TestBoverCronScheduler(unittest.TestCase):
     def setUp(self):

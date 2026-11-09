@@ -367,7 +367,10 @@ class TestBoverVaultAndIsolation(unittest.TestCase):
                 meta_content = tar.extractfile("backup-metadata.json").read().decode()
                 meta_json = json.loads(meta_content)
                 self.assertEqual(meta_json["app"], "testapp")
-                self.assertEqual(meta_json["backup_version"], 1)
+                self.assertGreaterEqual(meta_json["backup_version"], 1)
+                self.assertTrue(len(meta_json.get("databases", [])) > 0)
+                self.assertEqual(meta_json["databases"][0]["filename"], "app.db")
+                self.assertEqual(meta_json["databases"][0]["integrity_check"], "ok")
 
     def test_caddy_status_and_stats(self):
         mock_probe = {
@@ -535,6 +538,123 @@ class TestBoverVaultAndIsolation(unittest.TestCase):
             state = bover_mod.load_app_state("resumetest")
             self.assertEqual(state["active_slot"], "green")
             self.assertEqual(state["commit"], "abc1234")
+
+    def test_sqlite_database_integrity_inspection(self):
+        # 1. Test healthy database
+        db_file = self.apps_dir / "healthy.db"
+        conn = sqlite3.connect(str(db_file))
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);")
+        conn.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');")
+        conn.execute("INSERT INTO orders VALUES (10, 1, 99.5);")
+        conn.commit()
+        conn.close()
+
+        report = bover_mod.inspect_sqlite_database(db_file)
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["integrity_check"], "ok")
+        self.assertEqual(report["total_tables"], 2)
+        self.assertEqual(report["total_records"], 3)
+        self.assertEqual(report["tables"]["users"], 2)
+        self.assertEqual(report["tables"]["orders"], 1)
+
+        # 2. Test corrupted database
+        corrupt_file = self.apps_dir / "corrupted.db"
+        corrupt_file.write_bytes(b"NOT A SQLITE DATABASE CORRUPTED DATA" * 10)
+        corrupt_report = bover_mod.inspect_sqlite_database(corrupt_file)
+        self.assertFalse(corrupt_report["valid"])
+        self.assertNotEqual(corrupt_report["integrity_check"], "ok")
+
+        # 3. Test non-existent database
+        missing_report = bover_mod.inspect_sqlite_database(self.apps_dir / "missing.db")
+        self.assertFalse(missing_report["valid"])
+        self.assertEqual(missing_report["integrity_check"], "empty_or_missing")
+
+    def test_verify_backup_archive_valid_and_invalid(self):
+        import tarfile
+
+        app_name = "sampleapp"
+        staging = self.apps_dir / "staging_test"
+        staging.mkdir(parents=True, exist_ok=True)
+        data_staging = staging / "data"
+        data_staging.mkdir(parents=True, exist_ok=True)
+
+        # Write valid db
+        conn = sqlite3.connect(str(data_staging / "app.db"))
+        conn.execute("CREATE TABLE items (id INT, title TEXT);")
+        conn.execute("INSERT INTO items VALUES (1, 'Widget');")
+        conn.commit()
+        conn.close()
+
+        (staging / "app.json").write_text(json.dumps({"name": app_name, "domain": "sample.com", "port": 8000}))
+        (staging / ".env").write_text("API_KEY=12345\n")
+        (staging / "backup-metadata.json").write_text(json.dumps({"app": app_name, "backup_version": 2}))
+
+        valid_tar = self.apps_dir / "valid_backup.tar.gz"
+        with tarfile.open(valid_tar, "w:gz") as tar:
+            for item in staging.iterdir():
+                tar.add(item, arcname=item.name)
+
+        ok, res = bover_mod.verify_backup_archive(valid_tar, app_name=app_name)
+        self.assertTrue(ok)
+        self.assertTrue(res["valid"])
+        self.assertEqual(len(res["db_reports"]), 1)
+        self.assertEqual(res["db_reports"][0]["filename"], "app.db")
+        self.assertEqual(res["db_reports"][0]["integrity_check"], "ok")
+        self.assertEqual(res["db_reports"][0]["tables"]["items"], 1)
+
+        # Corrupt archive
+        corrupt_tar = self.apps_dir / "corrupted_backup.tar.gz"
+        corrupt_tar.write_bytes(b"garbage bytes that cannot decompress with gzip")
+        corrupt_ok, corrupt_res = bover_mod.verify_backup_archive(corrupt_tar, app_name=app_name)
+        self.assertFalse(corrupt_ok)
+        self.assertIn("error", corrupt_res)
+
+    def test_s3_sigv4_get_and_list_mocked(self):
+        xml_response = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <Contents>
+        <Key>myapp/backup_myapp_2026-11-09_05-00-00.tar.gz</Key>
+        <LastModified>2026-11-09T05:00:00.000Z</LastModified>
+        <Size>12345</Size>
+    </Contents>
+</ListBucketResult>"""
+
+        class MockResponse:
+            def __init__(self, data, status=200):
+                self.data = data
+                self.status = status
+            def read(self):
+                return self.data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch("urllib.request.urlopen", return_value=MockResponse(xml_response)):
+            ok, objs = bover_mod.s3_sigv4_list(
+                endpoint_url="https://test_acc.r2.cloudflarestorage.com",
+                bucket="test-bucket",
+                prefix="myapp/",
+                access_key="test_access",
+                secret_key="test_secret"
+            )
+            self.assertTrue(ok)
+            self.assertEqual(len(objs), 1)
+            self.assertEqual(objs[0]["key"], "myapp/backup_myapp_2026-11-09_05-00-00.tar.gz")
+            self.assertEqual(objs[0]["size"], 12345)
+
+        with patch("urllib.request.urlopen", return_value=MockResponse(b"GZIP_TAR_MOCK_DATA")):
+            ok, data = bover_mod.s3_sigv4_get(
+                endpoint_url="https://test_acc.r2.cloudflarestorage.com",
+                bucket="test-bucket",
+                key="myapp/backup_myapp_2026-11-09_05-00-00.tar.gz",
+                access_key="test_access",
+                secret_key="test_secret"
+            )
+            self.assertTrue(ok)
+            self.assertEqual(data, b"GZIP_TAR_MOCK_DATA")
 
 
 class TestBoverCronScheduler(unittest.TestCase):

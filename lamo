@@ -1128,6 +1128,16 @@ def cmd_app_action(base_cfg, args):
             run_ssh(cfg, "sudo -u bover bover backup config", interactive=True)
         elif action_or_app in ("all", "run-all"):
             run_ssh(cfg, "sudo -u bover bover backup all")
+        elif action_or_app in ("list", "ls"):
+            target_app = shlex.quote(validate_app_name(app_names[0])) if app_names else ""
+            run_ssh(cfg, f"sudo -u bover bover backup list {target_app}".strip())
+        elif action_or_app in ("verify", "check", "test"):
+            if not app_names:
+                print(f"{RED}ERROR: Application name required for 'backup verify <app>' (e.g. './lamo app backup verify horify').{RESET}")
+                sys.exit(1)
+            target_app = shlex.quote(validate_app_name(app_names[0]))
+            key_arg = f"--key {shlex.quote(args.key)}" if getattr(args, "key", None) else ""
+            run_ssh(cfg, f"sudo -u bover bover backup verify {target_app} {key_arg}".strip())
         elif action_or_app == "run":
             if not app_names:
                 print("Error: Application name required for 'backup run <app...>'")
@@ -1344,8 +1354,9 @@ Examples:
     ahist_p = app_sub.add_parser("history", help="Show deployment and rollback audit history")
     ahist_p.add_argument("app", nargs="?", help="Specific app name (optional)")
     abk_p = app_sub.add_parser("backup", help="Manage automated Cloudflare R2 / S3 backups")
-    abk_p.add_argument("action_or_app", nargs="?", default="all", help="'config', 'all', 'run', or application name(s)")
+    abk_p.add_argument("action_or_app", nargs="?", default="all", help="'config', 'all', 'list', 'verify', 'run', or application name(s)")
     abk_p.add_argument("app_names", nargs="*", default=[], help="Application name(s)")
+    abk_p.add_argument("--key", default=None, help="Specific R2 key to verify with 'backup verify'")
     aprune_p = app_sub.add_parser("prune", help="Enforce version retention lifecycle and prune old images")
     aprune_p.add_argument("app", nargs="?", help="Specific app name (optional)")
     app_sub.add_parser("autodeploy", help="Poll remote git repos and auto-deploy new commits")

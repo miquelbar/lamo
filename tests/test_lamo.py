@@ -262,6 +262,10 @@ class TestLamoArgparse(unittest.TestCase):
             (["lamo", "app", "backup", "run", "myapp"], "sudo -u bover bover backup run myapp", False),
             (["lamo", "app", "backup", "myapp", "app2"], "sudo -u bover bover backup run myapp app2", False),
             (["lamo", "app", "backup", "run", "myapp", "app2"], "sudo -u bover bover backup run myapp app2", False),
+            (["lamo", "app", "backup", "list"], "sudo -u bover bover backup list", False),
+            (["lamo", "app", "backup", "list", "myapp"], "sudo -u bover bover backup list myapp", False),
+            (["lamo", "app", "backup", "verify", "myapp"], "sudo -u bover bover backup verify myapp", False),
+            (["lamo", "app", "backup", "verify", "myapp", "--key", "myapp/test.tar.gz"], "sudo -u bover bover backup verify myapp --key myapp/test.tar.gz", False),
         ]
         for argv, expected_cmd, is_interactive in test_cases:
             with patch("sys.argv", argv), \

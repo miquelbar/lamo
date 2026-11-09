@@ -588,6 +588,49 @@ You can define crons in `/opt/apps/<app>/app.json` or commit a `crons.json` (or 
 
 ---
 
+## 15.C. Automated Cloudflare R2 Backups & Integrity Verification (`lamo app backup`)
+
+The platform includes a built-in automated backup and disaster recovery engine driven by `bover-backup.timer` (running daily at 03:00 UTC) with zero third-party pip dependencies:
+
+### A. Non-Blocking Hot Backup & Pre-Flight Verification
+* **Consistent Hot Copy:** For SQLite databases, `bover` leverages the native `sqlite3.backup` API, taking a consistent snapshot without stopping live containers or causing downtime.
+* **Pre-Flight Integrity Gate:** Before packaging, `bover` runs `PRAGMA integrity_check` on the database replica. If corruption is detected, the upload is aborted immediately and an alert is dispatched to Telegram.
+* **Complete State Packaging:** Includes persistent `/data` volumes, `app.json`, `.env` application secrets, server-wide `shared.env`, and a self-documenting `backup-metadata.json` manifest.
+* **Ownership Self-Healing:** After every backup run, file ownership in `/opt/apps/<app>/data` is strictly reconciled to `app_<name>:bover` (mode `0770`/`0660`), preventing WAL/SHM file locking issues.
+
+### B. Remote Cloudflare R2 / S3 Storage (AWS SigV4)
+* Direct encrypted upload over HTTPS to Cloudflare R2 or Amazon S3 using pure standard-library AWS Signature Version 4.
+* Credentials (`account_id`, `access_key`, `secret_key`, `bucket`) are stored in the host-salted vault (`/opt/apps/.vault/s3.json`, mode `0600`).
+
+### C. Disaster Recovery & Deep Integrity Verification (`verify`)
+You can inspect and verify any remote backup in a sandboxed temporary directory to guarantee that what was uploaded is genuine, uncorrupted, and 100% recoverable:
+
+```bash
+# List all remote backup archives stored in Cloudflare R2
+./lamo app backup list
+./lamo app backup list horify
+
+# Download latest backup from R2 and perform deep sandbox verification
+./lamo app backup verify horify
+./lamo app backup verify workdoku
+
+# Trigger immediate backup for one or all applications
+./lamo app backup run horify
+./lamo app backup all
+
+# Configure Cloudflare R2 credentials
+./lamo app backup config
+```
+
+What `verify` tests:
+1. **Archive & Checksum:** Validates gzip stream integrity, decompression, and computes SHA-256.
+2. **Configuration & Secrets:** Verifies `app.json` syntax and presence of `.env` secret keys.
+3. **SQLite PRAGMA Integrity Check:** Connects to each extracted database and executes `PRAGMA integrity_check;` (ensuring `ok`).
+4. **Relational Constraints:** Executes `PRAGMA foreign_key_check;` to verify relational consistency.
+5. **Schema & Table Record Breakdown:** Queries `sqlite_master` and counts rows across all application tables.
+
+---
+
 ## 16. Cinematic Visual Identity Suite (`assets/`)
 
 The platform branding is based on 19th-century Mallorcan agricultural archetypes in the Serra de Tramuntana:
@@ -658,7 +701,11 @@ make test
 ./lamo app cron run <app> <id>   # Manually execute a cron job immediately
 ./lamo app cron history [app]    # View cron execution audit log, exit codes & durations
 ./lamo app cron show <run_id>    # View full captured stdout/stderr for a cron execution
-./lamo app backup                # Manage automated Cloudflare R2 / S3 backups
+./lamo app backup                # Run automated backup for all apps
+./lamo app backup run <app>      # Trigger immediate backup for specific app(s)
+./lamo app backup list [app]     # List remote backup archives stored in Cloudflare R2
+./lamo app backup verify <app>   # Deep integrity test (SQLite PRAGMA, schema, secrets & files)
+./lamo app backup config         # Configure Cloudflare R2 / S3 vault credentials
 ./lamo app prune                 # Enforce version retention lifecycle and prune old images
 ./lamo app autodeploy            # Poll remote git repos and auto-deploy new commits
 ./lamo app add <repo-url>        # Interactive wizard to clone and configure an app
@@ -669,6 +716,6 @@ make test
 ./lamo telegram test             # Dispatch a test notification alert
 
 # Local Development & Testing
-make test                        # Run automated unit test suite (45 tests)
+make test                        # Run automated unit test suite (48 tests)
 make clean                       # Clean bytecode, pycache and temporary files
 ```

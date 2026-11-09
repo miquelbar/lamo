@@ -32,6 +32,8 @@ import socket
 import fcntl
 import signal
 import http.client
+import tempfile
+import tarfile
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +45,18 @@ CONF_DIR = GATEWAY_DIR / "conf.d"
 DB_PATH = APPS_DIR / "stats.db"
 VAULT_DIR = APPS_DIR / ".vault"
 DOCKER_NETWORK = "gateway"
+
+# Terminal Formatting & Colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+GOLD = "\033[38;5;220m"
 CADDY_CONTAINER = "caddy-gateway"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 CONFIG_FILENAMES = ["app.json", "service.json"]
@@ -4254,7 +4268,504 @@ def s3_sigv4_put(endpoint_url: str, bucket: str, key: str, data: bytes, access_k
         return False, str(e)
 
 
-def notify_backup_result(app_name: str, success: bool, destination_key: Optional[str] = None, file_size_bytes: int = 0, error: Optional[str] = None, duration: float = 0.0):
+def s3_sigv4_get(endpoint_url: str, bucket: str, key: str, access_key: str, secret_key: str, region: str = "auto") -> Tuple[bool, Union[bytes, str]]:
+    """
+    Download object payload from S3 / Cloudflare R2 using AWS Signature Version 4.
+    Self-contained pure Python implementation with zero third-party pip dependencies.
+    """
+    clean_endpoint = endpoint_url.strip().rstrip("/")
+    m = re.match(r"^https?://([^/]+)", clean_endpoint)
+    if not m:
+        return False, f"Invalid S3 endpoint URL: {endpoint_url}"
+    host = m.group(1)
+
+    t = datetime.now(timezone.utc)
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
+
+    clean_key = key.lstrip("/")
+    canonical_uri = f"/{bucket}/{clean_key}"
+    full_url = f"{clean_endpoint}{canonical_uri}"
+
+    payload_hash = hashlib.sha256(b"").hexdigest()
+
+    canonical_headers = f"host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = f"GET\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+
+    def sign_key(key_bytes, msg):
+        return hmac.new(key_bytes, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = sign_key(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = sign_key(k_date, region)
+    k_service = sign_key(k_region, "s3")
+    k_signing = sign_key(k_service, "aws4_request")
+
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    auth_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        full_url,
+        method="GET",
+        headers={
+            "Host": host,
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": payload_hash,
+            "Authorization": auth_header,
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status in (200, 206):
+                return True, resp.read()
+            return False, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {e.code}: {body[:250]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def s3_sigv4_list(endpoint_url: str, bucket: str, prefix: str = "", access_key: str = "", secret_key: str = "", region: str = "auto") -> Tuple[bool, Union[List[Dict[str, Any]], str]]:
+    """
+    List objects in S3 / Cloudflare R2 bucket using AWS Signature Version 4 and ListObjectsV2.
+    Returns list of dicts with keys: 'key', 'size', 'last_modified'.
+    """
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    clean_endpoint = endpoint_url.strip().rstrip("/")
+    m = re.match(r"^https?://([^/]+)", clean_endpoint)
+    if not m:
+        return False, f"Invalid S3 endpoint URL: {endpoint_url}"
+    host = m.group(1)
+
+    t = datetime.now(timezone.utc)
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
+
+    canonical_uri = f"/{bucket}"
+    params = [("list-type", "2")]
+    if prefix:
+        params.append(("prefix", prefix))
+    params.sort(key=lambda x: x[0])
+    canonical_qs = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}" for k, v in params)
+
+    full_url = f"{clean_endpoint}{canonical_uri}?{canonical_qs}"
+    payload_hash = hashlib.sha256(b"").hexdigest()
+
+    canonical_headers = f"host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = f"GET\n{canonical_uri}\n{canonical_qs}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+
+    def sign_key(key_bytes, msg):
+        return hmac.new(key_bytes, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = sign_key(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = sign_key(k_date, region)
+    k_service = sign_key(k_region, "s3")
+    k_signing = sign_key(k_service, "aws4_request")
+
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    auth_header = f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        full_url,
+        method="GET",
+        headers={
+            "Host": host,
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": payload_hash,
+            "Authorization": auth_header,
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+            root = ET.fromstring(data)
+            objects = []
+            for elem in root.iter():
+                if elem.tag.endswith("Contents"):
+                    key_val = ""
+                    size_val = 0
+                    mod_val = ""
+                    for child in elem:
+                        if child.tag.endswith("Key") and child.text:
+                            key_val = child.text
+                        elif child.tag.endswith("Size") and child.text:
+                            try:
+                                size_val = int(child.text)
+                            except Exception:
+                                size_val = 0
+                        elif child.tag.endswith("LastModified") and child.text:
+                            mod_val = child.text
+                    if key_val:
+                        objects.append({
+                            "key": key_val,
+                            "size": size_val,
+                            "last_modified": mod_val,
+                        })
+            objects.sort(key=lambda x: x.get("last_modified", "") or x.get("key", ""), reverse=True)
+            return True, objects
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {e.code}: {body[:250]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def inspect_sqlite_database(db_path: Path) -> Dict[str, Any]:
+    """
+    Run deep integrity checks and schema verification on a SQLite database file.
+    Returns structured inspection dict with integrity status, schema, tables, and row counts.
+    """
+    res = {
+        "filename": db_path.name,
+        "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "integrity_check": "unknown",
+        "quick_check": "unknown",
+        "foreign_key_check": "unknown",
+        "tables": {},
+        "total_records": 0,
+        "total_tables": 0,
+        "total_indexes": 0,
+        "valid": False,
+        "error": None,
+    }
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        res["integrity_check"] = "empty_or_missing"
+        res["error"] = "Database file is empty (0 bytes) or does not exist."
+        return res
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
+        cursor = conn.cursor()
+
+        # 1. PRAGMA integrity_check
+        cursor.execute("PRAGMA integrity_check;")
+        rows = cursor.fetchall()
+        if rows and len(rows) == 1 and rows[0][0] == "ok":
+            res["integrity_check"] = "ok"
+        else:
+            res["integrity_check"] = "; ".join(str(r[0]) for r in rows)
+            res["error"] = f"Integrity check failed: {res['integrity_check']}"
+
+        # 2. PRAGMA quick_check
+        cursor.execute("PRAGMA quick_check;")
+        q_rows = cursor.fetchall()
+        res["quick_check"] = "ok" if (q_rows and q_rows[0][0] == "ok") else "failed"
+
+        # 3. PRAGMA foreign_key_check
+        cursor.execute("PRAGMA foreign_key_check;")
+        fk_rows = cursor.fetchall()
+        res["foreign_key_check"] = "ok" if not fk_rows else f"{len(fk_rows)} violations"
+
+        # 4. Tables and row counts
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        tables = [r[0] for r in cursor.fetchall()]
+        res["total_tables"] = len(tables)
+
+        cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='index';")
+        res["total_indexes"] = cursor.fetchone()[0]
+
+        total_rows = 0
+        table_counts = {}
+        for tbl in tables:
+            try:
+                escaped_tbl = f'"{tbl}"'
+                cursor.execute(f"SELECT COUNT(*) FROM {escaped_tbl}")
+                cnt = cursor.fetchone()[0]
+                table_counts[tbl] = cnt
+                total_rows += cnt
+            except Exception as e:
+                table_counts[tbl] = f"error: {e}"
+
+        res["tables"] = table_counts
+        res["total_records"] = total_rows
+        res["valid"] = (res["integrity_check"] == "ok")
+        conn.close()
+    except Exception as e:
+        res["error"] = str(e)
+        res["integrity_check"] = "exception"
+
+    return res
+
+
+def verify_backup_archive(tar_path: Path, app_name: Optional[str] = None, source_label: str = "") -> Tuple[bool, Dict[str, Any]]:
+    """
+    Extract a backup tar.gz archive in a sandbox temp directory, inspect its metadata,
+    configuration, secrets, and run deep SQLite PRAGMA integrity checks on all database files.
+    """
+    import tempfile
+    import tarfile
+
+    if not tar_path.exists():
+        return False, {"error": f"Backup file '{tar_path}' does not exist."}
+
+    archive_size = tar_path.stat().st_size
+    archive_sha256 = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="bover_verify_"))
+    try:
+        try:
+            with tarfile.open(tar_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if ".." in member.name or member.name.startswith("/"):
+                        raise ValueError(f"Dangerous path in archive member: {member.name}")
+                tar.extractall(path=temp_dir)
+        except Exception as e:
+            return False, {"error": f"Archive extraction failed (corrupted gzip or invalid tar): {e}"}
+
+        # 1. Metadata check
+        meta_file = temp_dir / "backup-metadata.json"
+        metadata = {}
+        if meta_file.exists():
+            try:
+                metadata = json.loads(meta_file.read_text())
+            except Exception:
+                pass
+
+        # 2. App config & secrets check
+        app_json = temp_dir / "app.json"
+        app_json_valid = False
+        app_json_data = {}
+        if app_json.exists():
+            try:
+                app_json_data = json.loads(app_json.read_text())
+                app_json_valid = bool(app_json_data.get("name"))
+            except Exception:
+                pass
+
+        env_file = temp_dir / ".env"
+        env_vars_count = 0
+        if env_file.exists():
+            try:
+                env_vars_count = len([line for line in env_file.read_text().splitlines() if line.strip() and not line.strip().startswith("#")])
+            except Exception:
+                pass
+
+        # 3. Persistent data & database verification
+        data_dir = temp_dir / "data"
+        db_reports = []
+        non_db_files = []
+        if data_dir.exists():
+            for item in data_dir.rglob("*"):
+                if item.is_file():
+                    if item.suffix in (".db", ".sqlite", ".sqlite3"):
+                        report = inspect_sqlite_database(item)
+                        db_reports.append(report)
+                    else:
+                        non_db_files.append({
+                            "name": item.relative_to(data_dir).as_posix(),
+                            "size": item.stat().st_size,
+                        })
+
+        all_dbs_ok = True
+        if db_reports:
+            for rep in db_reports:
+                if not rep.get("valid"):
+                    all_dbs_ok = False
+
+        is_valid = bool(app_json_valid and all_dbs_ok)
+        result = {
+            "valid": is_valid,
+            "archive_size": archive_size,
+            "archive_sha256": archive_sha256,
+            "source_label": source_label or tar_path.name,
+            "metadata": metadata,
+            "app_json_valid": app_json_valid,
+            "app_json_data": app_json_data,
+            "env_vars_count": env_vars_count,
+            "db_reports": db_reports,
+            "non_db_files": non_db_files,
+        }
+        return is_valid, result
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def cmd_backup_verify(app_name: str, key: Optional[str] = None, file_path: Optional[str] = None) -> bool:
+    """Download latest backup from Cloudflare R2 (or inspect specific file/key) and verify integrity."""
+    validate_app_name(app_name)
+    s3_cfg = load_s3_config()
+
+    tar_to_verify = None
+    temp_dir_to_clean = None
+    source_label = ""
+
+    if file_path:
+        tar_to_verify = Path(file_path)
+        source_label = f"Local file: {tar_to_verify}"
+        if not tar_to_verify.exists():
+            print(f"ERROR: Specified backup file '{file_path}' does not exist.")
+            return False
+    else:
+        if not s3_cfg:
+            print("ERROR: S3 / Cloudflare R2 credentials not configured. Run './lamo app backup config' first.")
+            return False
+
+        endpoint = s3_cfg.get("endpoint_url") or f"https://{s3_cfg['account_id']}.r2.cloudflarestorage.com"
+        target_key = key
+        if not target_key:
+            print(f"==> Querying Cloudflare R2 for latest backup of '{app_name}'...")
+            ok, objs = s3_sigv4_list(
+                endpoint_url=endpoint,
+                bucket=s3_cfg["bucket"],
+                prefix=f"{app_name}/",
+                access_key=s3_cfg["access_key"],
+                secret_key=s3_cfg["secret_key"]
+            )
+            if not ok or not isinstance(objs, list) or not objs:
+                print(f"ERROR: No backups found in Cloudflare R2 for '{app_name}'. Details: {objs}")
+                return False
+            target_key = objs[0]["key"]
+
+        print(f"==> Downloading backup archive from R2: r2://{s3_cfg['bucket']}/{target_key}...")
+        ok, payload_or_err = s3_sigv4_get(
+            endpoint_url=endpoint,
+            bucket=s3_cfg["bucket"],
+            key=target_key,
+            access_key=s3_cfg["access_key"],
+            secret_key=s3_cfg["secret_key"]
+        )
+        if not ok or not isinstance(payload_or_err, bytes):
+            print(f"ERROR: Failed to download backup archive from Cloudflare R2: {payload_or_err}")
+            return False
+
+        temp_dir_to_clean = Path(tempfile.mkdtemp(prefix=f"bover_verify_dl_{app_name}_"))
+        tar_to_verify = temp_dir_to_clean / Path(target_key).name
+        tar_to_verify.write_bytes(payload_or_err)
+        source_label = f"r2://{s3_cfg['bucket']}/{target_key}"
+
+    try:
+        ok, res = verify_backup_archive(tar_to_verify, app_name=app_name, source_label=source_label)
+        meta = res.get("metadata", {})
+        created_at = meta.get("created_at") or "Unknown"
+        active_slot = meta.get("active_slot") or "Unknown"
+        commit = meta.get("commit") or "Unknown"
+        host = meta.get("hostname") or "Unknown"
+
+        print(f"\n{BOLD}{'=' * 82}{RESET}")
+        print(f" {GOLD}BOVER :: BACKUP INTEGRITY & DISASTER RECOVERY VERIFICATION{RESET}")
+        print(f"{BOLD}{'=' * 82}{RESET}")
+        print(f" App Target:    {BOLD}{app_name}{RESET}")
+        print(f" Archive:       {source_label}")
+        print(f" Archive Size:  {format_bytes(res.get('archive_size', 0))} (SHA-256: {res.get('archive_sha256', '')[:16]}...)")
+        print(f" Origin Node:   {host} (Slot: {active_slot} · Commit: {commit})")
+        print(f" Created At:    {created_at}")
+
+        cfg_status = "🟢 Valid JSON" if res.get("app_json_valid") else "🔴 Invalid / Missing"
+        env_status = f"🟢 Present ({res.get('env_vars_count', 0)} secrets)" if res.get("env_vars_count", 0) > 0 else "⚪ None"
+        print(f" Config & Env:  {cfg_status} | .env: {env_status}")
+        print(f"{BOLD}{'-' * 82}{RESET}")
+
+        dbs = res.get("db_reports", [])
+        if dbs:
+            print(f" {CYAN}DATABASE INTEGRITY VERIFICATION ({len(dbs)} database(s) found):{RESET}")
+            for db in dbs:
+                filename = db.get("filename", "")
+                size_str = format_bytes(db.get("size_bytes", 0))
+                integ = db.get("integrity_check", "")
+                fk = db.get("foreign_key_check", "")
+                tables = db.get("tables", {})
+                total_recs = db.get("total_records", 0)
+
+                status_icon = "🟢" if db.get("valid") else "🔴"
+                print(f" • {status_icon} {BOLD}{filename}{RESET} ({size_str}):")
+                print(f"   - PRAGMA integrity_check:   {'🟢 PASSED (ok)' if integ == 'ok' else f'🔴 FAILED ({integ})'}")
+                print(f"   - PRAGMA foreign_key_check: {'🟢 PASSED (0 violations)' if fk == 'ok' else f'⚠️  {fk}'}")
+                print(f"   - Total Tables:             {len(tables)} tables ({total_recs:,} records total)")
+                if tables:
+                    tbl_items = list(tables.items())[:8]
+                    tbl_summary = ", ".join(f"{t}: {c}" for t, c in tbl_items)
+                    if len(tables) > 8:
+                        tbl_summary += f", ... (+{len(tables) - 8} more)"
+                    print(f"   - Schema Breakdown:         {tbl_summary}")
+        else:
+            non_dbs = res.get("non_db_files", [])
+            print(f" {CYAN}PERSISTENT STORAGE VERIFICATION (Non-SQLite app):{RESET}")
+            print(f" • Persistent files: {len(non_dbs)} file(s) found in data archive")
+            for nd in non_dbs[:5]:
+                print(f"   - {nd['name']} ({format_bytes(nd['size'])})")
+
+        print(f"{BOLD}{'-' * 82}{RESET}")
+        if ok:
+            print(f" {GREEN}{BOLD}VERDICT: 🟢 BACKUP IS 100% HEALTHY, VALID & DISASTER RECOVERY READY{RESET}")
+            print(f"{BOLD}{'=' * 82}{RESET}\n")
+            return True
+        else:
+            print(f" {RED}{BOLD}VERDICT: 🔴 BACKUP INTEGRITY FAILED OR CORRUPTED!{RESET}")
+            if res.get("error"):
+                print(f" Error: {res.get('error')}")
+            print(f"{BOLD}{'=' * 82}{RESET}\n")
+            return False
+    finally:
+        if temp_dir_to_clean:
+            shutil.rmtree(temp_dir_to_clean, ignore_errors=True)
+
+
+def cmd_backup_list(app_name: Optional[str] = None):
+    """List available backups in Cloudflare R2 / S3."""
+    s3_cfg = load_s3_config()
+    if not s3_cfg:
+        print("ERROR: S3 / Cloudflare R2 credentials not configured. Run './lamo app backup config' first.")
+        return
+
+    endpoint = s3_cfg.get("endpoint_url") or f"https://{s3_cfg['account_id']}.r2.cloudflarestorage.com"
+    prefix = f"{app_name}/" if app_name else ""
+    print(f"==> Querying Cloudflare R2 backups bucket '{s3_cfg['bucket']}'...")
+    ok, objs = s3_sigv4_list(
+        endpoint_url=endpoint,
+        bucket=s3_cfg["bucket"],
+        prefix=prefix,
+        access_key=s3_cfg["access_key"],
+        secret_key=s3_cfg["secret_key"]
+    )
+    if not ok or not isinstance(objs, list):
+        print(f"ERROR: Failed to list backups in R2: {objs}")
+        return
+
+    if not objs:
+        target_str = f" for '{app_name}'" if app_name else ""
+        print(f"No backup archives found in Cloudflare R2{target_str}.")
+        return
+
+    headers = ["APP", "BACKUP ARCHIVE KEY", "SIZE", "LAST MODIFIED (UTC)"]
+    rows = []
+    for o in objs:
+        key = o.get("key", "")
+        parts = key.split("/", 1)
+        app_tag = parts[0] if len(parts) > 1 else "-"
+        size_str = format_bytes(o.get("size", 0))
+        mod = o.get("last_modified", "").replace("T", " ").replace(".000Z", " UTC")
+        rows.append([app_tag, key, size_str, mod])
+
+    hdr_line, sep_line, row_lines = format_table(headers, rows, max_width=110)
+    w = max(len(hdr_line), 82)
+    print(f"\n{BOLD}{'=' * w}{RESET}")
+    print(f" {GOLD}BOVER :: CLOUDFLARE R2 REMOTE BACKUP REGISTRY{RESET}")
+    print(f"{BOLD}{'=' * w}{RESET}")
+    print(hdr_line)
+    print(sep_line)
+    for r in row_lines:
+        print(r)
+    print(f"{BOLD}{'=' * w}{RESET}")
+    print(f"\n💡 Run './lamo app backup verify <app>' to test recovery integrity of the latest backup.\n")
+
+
+def notify_backup_result(app_name: str, success: bool, destination_key: Optional[str] = None, file_size_bytes: int = 0, error: Optional[str] = None, duration: float = 0.0, integrity_summary: Optional[str] = None):
     """Notify operator via Telegram with Es Bover avatar."""
     hostname = run_cmd("hostname", capture=True) or "server"
     status_icon = "✅" if success else "❌"
@@ -4271,6 +4782,8 @@ def notify_backup_result(app_name: str, success: bool, destination_key: Optional
     )
     if destination_key:
         text += f"☁️  <b>Destino R2:</b> <code>{destination_key}</code>\n"
+    if integrity_summary:
+        text += f"🔍 <b>Verificación:</b> {integrity_summary}\n"
     if size_str:
         text += f"📦 <b>Tamaño:</b> <code>{size_str}</code>\n"
     if duration:
@@ -4322,6 +4835,7 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
         data_staging.mkdir(parents=True, exist_ok=True)
 
         # 1. Hot-backup persistent data files & databases
+        verified_databases = []
         if host_data_dir and host_data_dir.exists():
             for item in host_data_dir.iterdir():
                 if item.is_file():
@@ -4335,6 +4849,12 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
                             conn.close()
                         except Exception:
                             shutil.copy2(item, hot_dest)
+
+                        # Deep integrity verification on the backed up copy before upload
+                        db_report = inspect_sqlite_database(hot_dest)
+                        if not db_report.get("valid"):
+                            raise RuntimeError(f"Database backup integrity check failed for '{item.name}': {db_report.get('error') or db_report.get('integrity_check')}")
+                        verified_databases.append(db_report)
                     else:
                         shutil.copy2(item, data_staging / item.name)
                 elif item.is_dir() and item.name != "lost+found":
@@ -4364,7 +4884,8 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
             "commit": app_state.get("commit"),
             "deployed_at": app_state.get("deployed_at"),
             "hostname": run_cmd("hostname", capture=True) or "server",
-            "backup_version": 1,
+            "backup_version": 2,
+            "databases": verified_databases,
         }
         (staging_dir / "backup-metadata.json").write_text(json.dumps(metadata, indent=2))
 
@@ -4372,6 +4893,11 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
         with tarfile.open(tar_path, "w:gz") as tar:
             for item in staging_dir.iterdir():
                 tar.add(item, arcname=item.name)
+
+        # Verify archive can be opened cleanly
+        with tarfile.open(tar_path, "r:gz") as tar_test:
+            if not tar_test.getmembers():
+                raise RuntimeError("Backup archive is unexpectedly empty.")
 
         file_size = tar_path.stat().st_size
         tar_data = tar_path.read_bytes()
@@ -4388,6 +4914,10 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
         )
 
         duration = time.time() - start_time
+        integ_summary = ""
+        if verified_databases:
+            integ_summary = f"🟢 {len(verified_databases)} SQLite DB(s) verified (PRAGMA integrity_check: ok)"
+
         if notify:
             notify_backup_result(
                 app_name=app_name,
@@ -4395,11 +4925,16 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
                 destination_key=f"r2://{s3_cfg['bucket']}/{r2_key}" if success else None,
                 file_size_bytes=file_size if success else 0,
                 error=err if not success else None,
-                duration=duration
+                duration=duration,
+                integrity_summary=integ_summary,
             )
 
         if success:
-            print(f"✓ Backup for '{app_name}' completed in {duration:.1f}s: r2://{s3_cfg['bucket']}/{r2_key} ({format_bytes(file_size)})")
+            db_report_str = ""
+            if verified_databases:
+                db_names = ", ".join(f"{d['filename']}: ok ({d['total_tables']} tables, {d['total_records']} rows)" for d in verified_databases)
+                db_report_str = f"\n  • Integrity: 🟢 Verified ({db_names})"
+            print(f"✓ Backup for '{app_name}' completed in {duration:.1f}s: r2://{s3_cfg['bucket']}/{r2_key} ({format_bytes(file_size)}){db_report_str}")
             return True, r2_key, file_size, duration
         else:
             print(f"ERROR: Backup upload failed for '{app_name}': {err}")
@@ -5598,6 +6133,14 @@ def main():
     bk_cfg_p.add_argument("--secret-key", help="R2 Secret Access Key")
     bk_cfg_p.add_argument("--bucket", help="R2 Bucket Name")
 
+    bk_ls_p = bk_sub.add_parser("list", aliases=["ls"], help="List backup archives available in Cloudflare R2")
+    bk_ls_p.add_argument("app", nargs="?", default=None, help="Optional application name")
+
+    bk_ver_p = bk_sub.add_parser("verify", aliases=["check", "test"], help="Download and verify backup integrity (SQLite PRAGMA, schema, and files)")
+    bk_ver_p.add_argument("app", help="Application name to verify")
+    bk_ver_p.add_argument("--key", default=None, help="Specific R2 key to verify (defaults to latest)")
+    bk_ver_p.add_argument("--file", default=None, help="Local backup tar.gz file to verify instead of downloading from R2")
+
     # cron
     cron_p = subparsers.add_parser("cron", aliases=["crons"], help="Manage per-project scheduled cron jobs & execution history")
     cron_sub = cron_p.add_subparsers(dest="cron_action", help="Cron action")
@@ -5801,6 +6344,16 @@ def main():
             backup_all()
         elif args.backup_action == "run":
             run_backups_batch(args.apps)
+        elif args.backup_action in ("list", "ls"):
+            cmd_backup_list(getattr(args, "app", None))
+        elif args.backup_action in ("verify", "check", "test"):
+            ok = cmd_backup_verify(
+                app_name=args.app,
+                key=getattr(args, "key", None),
+                file_path=getattr(args, "file", None)
+            )
+            if not ok:
+                sys.exit(1)
         else:
             bk_p.print_help()
     elif args.command in ("cron", "crons"):

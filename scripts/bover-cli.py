@@ -4406,6 +4406,11 @@ def run_app_backup(app_name: str, notify: bool = True) -> Tuple[bool, str, int, 
             return False, err, 0, duration
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        # Ensure that any SQLite WAL/SHM files touched or created during hot backup
+        # are restored to app ownership so the container user never loses access.
+        if APPS_DIR == Path("/opt/apps") and Path("/usr/local/bin/bover-helper").exists():
+            sudo_pfx = "sudo -n " if os.geteuid() != 0 else ""
+            run_cmd(f"{sudo_pfx}/usr/local/bin/bover-helper chown-app {shlex.quote(app_name)} 2>/dev/null || true", check=False)
 
 
 def notify_backup_summary(results: List[Dict[str, Any]]):

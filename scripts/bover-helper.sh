@@ -56,6 +56,11 @@ case "${ACTION}" in
         if [[ -d "${APP_DIR}" ]]; then
             chown -R "${APP_USER}:bover" "${APP_DIR}"
             chmod 770 "${APP_DIR}"
+            if [[ -d "${APP_DIR}/data" ]]; then
+                chmod 770 "${APP_DIR}/data"
+                find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
+                find "${APP_DIR}/data" -type d -exec chmod 770 {} + 2>/dev/null || true
+            fi
             if [[ -f "${APP_DIR}/app.json" ]]; then
                 chmod 660 "${APP_DIR}/app.json"
             fi

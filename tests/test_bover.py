@@ -908,5 +908,322 @@ class TestBoverCronScheduler(unittest.TestCase):
             self.assertEqual(mock_exec.call_args[0][2], "catchup")
 
 
+class TestBoverPermissionAndIsolationRegression(unittest.TestCase):
+    """
+    Regression test suite specifically verifying that file permissions,
+    systemd privilege boundaries, container group memberships, and SQLite
+    WAL/SHM accessibility cannot regress.
+    """
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.apps_dir = Path(self.test_dir.name) / "apps"
+        self.apps_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.apps_dir / ".state.db"
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def test_systemd_units_sudo_privilege_boundary_regression(self):
+        """
+        Verify that bover-backup.service and bover-autodeploy.service do NOT contain
+        NoNewPrivileges=true, allowing them to invoke the scoped bover-helper via sudo,
+        while strictly sandboxed units without sudo DO retain NoNewPrivileges=true.
+        """
+        calls = []
+
+        def track_write(path_obj, content):
+            calls.append((str(path_obj), content))
+
+        with patch("pathlib.Path.write_text", track_write), \
+             patch.object(bover_mod, "run_cmd"):
+            bover_mod.install_systemd_units()
+
+        units_dict = {path: content for path, content in calls}
+
+        # 1. Backup service: must run 'bover backup all' as bover:bover without NoNewPrivileges
+        bk_service = units_dict.get("/etc/systemd/system/bover-backup.service")
+        self.assertIsNotNone(bk_service, "bover-backup.service must be generated")
+        self.assertIn("ExecStart=/usr/local/bin/bover backup all", bk_service)
+        self.assertIn("User=bover", bk_service)
+        self.assertIn("Group=bover", bk_service)
+        self.assertIn("ProtectSystem=strict", bk_service)
+        self.assertNotIn("NoNewPrivileges=true", bk_service,
+                         "bover-backup.service must NOT have NoNewPrivileges=true so sudo can run bover-helper")
+
+        # 2. Autodeploy service: must run 'bover autodeploy' without NoNewPrivileges
+        ad_service = units_dict.get("/etc/systemd/system/bover-autodeploy.service")
+        self.assertIsNotNone(ad_service, "bover-autodeploy.service must be generated")
+        self.assertIn("ExecStart=/usr/local/bin/bover autodeploy", ad_service)
+        self.assertIn("User=bover", ad_service)
+        self.assertIn("Group=bover", ad_service)
+        self.assertIn("ProtectSystem=strict", ad_service)
+        self.assertNotIn("NoNewPrivileges=true", ad_service,
+                         "bover-autodeploy.service must NOT have NoNewPrivileges=true so sudo can run bover-helper")
+
+        # 3. Units that do not need sudo MUST retain NoNewPrivileges=true
+        gw_service = units_dict.get("/etc/systemd/system/bover-gateway.service")
+        self.assertIsNotNone(gw_service)
+        self.assertIn("NoNewPrivileges=true", gw_service)
+
+        cron_service = units_dict.get("/etc/systemd/system/bover-cron.service")
+        self.assertIsNotNone(cron_service)
+        self.assertIn("NoNewPrivileges=true", cron_service)
+
+    def test_dockerfile_deploy_injects_group_add_bover_regression(self):
+        """
+        Verify that deploying a Dockerfile-based app injects --group-add {bover_gid}
+        into 'docker run', ensuring container user (app_<name>) has group write to bover files.
+        """
+        app_name = "horifyreg"
+        app_dir = self.apps_dir / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = app_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "Dockerfile").write_text("FROM alpine\n")
+        (app_dir / "app.json").write_text(json.dumps({
+            "name": app_name,
+            "domain": "horifyreg.test",
+            "port": 8000,
+            "type": "dockerfile",
+            "volumes": [f"{data_dir}:/app/data"]
+        }))
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch.object(bover_mod, "CONF_DIR", self.apps_dir / "gateway" / "conf.d"), \
+             patch.object(bover_mod, "DRAIN_SECONDS", 0), \
+             patch.object(bover_mod, "get_bover_gid", return_value=987), \
+             patch.object(bover_mod, "get_or_create_app_user", return_value=(f"app_{app_name}", 2194)), \
+             patch.object(bover_mod, "git_sync"), \
+             patch.object(bover_mod, "run_healthcheck", return_value=True), \
+             patch.object(bover_mod, "reload_caddy"), \
+             patch.object(bover_mod, "enable_app_systemd"), \
+             patch.object(bover_mod, "record_deployment_finish", return_value=1.0), \
+             patch.object(bover_mod, "notify_deploy_success"), \
+             patch.object(bover_mod, "prune_app_versions"), \
+             patch.object(bover_mod, "refresh_docker_cache"), \
+             patch.object(bover_mod, "reconcile_app_permissions") as mock_reconcile, \
+             patch.object(bover_mod, "run_cmd", return_value="") as mock_cmd:
+
+            ok = bover_mod.deploy_app(app_name, no_pull=True)
+            self.assertTrue(ok)
+
+            # Find the 'docker run' command
+            executed_cmds = [c[0][0] for c in mock_cmd.call_args_list if isinstance(c[0][0], str)]
+            docker_runs = [cmd for cmd in executed_cmds if "docker run" in cmd]
+            self.assertTrue(len(docker_runs) > 0, "docker run must have been executed")
+            run_cmd_str = docker_runs[0]
+
+            # Assert essential security and permission parameters:
+            self.assertIn("--group-add 987", run_cmd_str,
+                          "docker run must include '--group-add {bover_gid}' so container can access bover group files")
+            self.assertIn("--user 2194:2194", run_cmd_str,
+                          "docker run must enforce dedicated app user UID:GID")
+            self.assertIn("--security-opt no-new-privileges:true", run_cmd_str)
+
+            # Assert permissions were reconciled on completion
+            mock_reconcile.assert_called_with(app_name)
+
+    def test_docker_compose_deploy_injects_group_add_bover_regression(self):
+        """
+        Verify that deploying a Docker Compose app generates an override containing
+        group_add: - "{bover_gid}".
+        """
+        app_name = "composereg"
+        app_dir = self.apps_dir / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "docker-compose.yml").write_text("""
+services:
+  web:
+    image: nginx:alpine
+""")
+        (app_dir / "app.json").write_text(json.dumps({
+            "name": app_name,
+            "domain": "compose.test",
+            "port": 80
+        }))
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch.object(bover_mod, "CONF_DIR", self.apps_dir / "gateway" / "conf.d"), \
+             patch.object(bover_mod, "DRAIN_SECONDS", 0), \
+             patch.object(bover_mod, "get_bover_gid", return_value=987), \
+             patch.object(bover_mod, "get_or_create_app_user", return_value=(f"app_{app_name}", 2050)), \
+             patch.object(bover_mod, "git_sync"), \
+             patch.object(bover_mod, "run_healthcheck", return_value=True), \
+             patch.object(bover_mod, "reload_caddy"), \
+             patch.object(bover_mod, "enable_app_systemd"), \
+             patch.object(bover_mod, "record_deployment_finish", return_value=1.0), \
+             patch.object(bover_mod, "notify_deploy_success"), \
+             patch.object(bover_mod, "prune_app_versions"), \
+             patch.object(bover_mod, "refresh_docker_cache"), \
+             patch.object(bover_mod, "reconcile_app_permissions"), \
+             patch.object(bover_mod, "run_cmd", return_value=""):
+
+            ok = bover_mod.deploy_app(app_name, no_pull=True)
+            self.assertTrue(ok)
+
+            override_file = app_dir / ".lamo-override-blue.yml"
+            self.assertTrue(override_file.exists())
+            content = override_file.read_text()
+            self.assertIn("group_add:", content)
+            self.assertIn('"987"', content, "docker-compose override must inject group_add with bover_gid")
+            self.assertIn('user: "2050:2050"', content)
+
+    def test_reconcile_app_permissions_regression(self):
+        """
+        Verify reconcile_app_permissions calls bover-helper chown-app with sudo -n
+        when running as non-root, handles success and failure cleanly.
+        """
+        with patch.object(bover_mod, "APPS_DIR", Path("/opt/apps")), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch.object(bover_mod, "run_cmd", return_value="OK: Ownership refreshed on '/opt/apps/mytest'.") as mock_cmd:
+            ok = bover_mod.reconcile_app_permissions("mytest")
+            self.assertTrue(ok)
+            called_cmd = mock_cmd.call_args[0][0]
+            self.assertIn("/usr/local/bin/bover-helper chown-app mytest", called_cmd)
+
+        # Failure case: returns False without raising
+        with patch.object(bover_mod, "APPS_DIR", Path("/opt/apps")), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch.object(bover_mod, "run_cmd", return_value="ERROR: sudo failed"):
+            ok_fail = bover_mod.reconcile_app_permissions("mytest")
+            self.assertFalse(ok_fail)
+
+    def test_bover_helper_script_permissions_contract_regression(self):
+        """
+        Verify that bover-helper.sh strictly implements SetGID (2770) on data dirs,
+        mode 660 on files, mode 660 on .bover* / lock / state / json files,
+        and adds app users to group bover.
+        """
+        helper_path = BASE_DIR / "scripts" / "bover-helper.sh"
+        self.assertTrue(helper_path.exists())
+        content = helper_path.read_text()
+
+        # SetGID on data directory
+        self.assertIn('chmod 2770 "${APP_DIR}/data"', content,
+                      "bover-helper must set SetGID (2770) on data directory")
+        self.assertIn('find "${APP_DIR}/data" -type d -exec chmod 2770', content,
+                      "bover-helper must set 2770 on subdirectories")
+        self.assertIn('find "${APP_DIR}/data" -type f -exec chmod 660', content,
+                      "bover-helper must set 660 on data files")
+
+        # Permissions on deployment lock, state and app.json
+        self.assertIn('chmod 660 "${f}"', content)
+        self.assertIn('.*lock*', content)
+        self.assertIn('.*state*', content)
+        self.assertIn('.bover*', content)
+
+        # App user added to bover group
+        self.assertIn('-G bover "${APP_USER}"', content)
+        self.assertIn('usermod -a -G bover "${APP_USER}"', content)
+
+    def test_backup_wal_reconciles_permissions_in_all_phases_regression(self):
+        """
+        Verify that run_app_backup executes reconcile_app_permissions:
+        1. Before snapshot
+        2. Immediately after database snapshot
+        3. In the finally: block (even on error)
+        """
+        app_name = "waltest"
+        app_dir = self.apps_dir / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = app_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create simulated WAL database and companions
+        db_file = data_dir / "worktime.db"
+        conn = sqlite3.connect(str(db_file))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("CREATE TABLE records (id INT, note TEXT);")
+        conn.execute("INSERT INTO records VALUES (1, 'active shift');")
+        conn.commit()
+        conn.close()
+
+        (data_dir / "worktime.db-wal").write_bytes(b"wal data")
+        (data_dir / "worktime.db-shm").write_bytes(b"shm data")
+
+        (app_dir / "app.json").write_text(json.dumps({
+            "name": app_name,
+            "domain": "wal.test",
+            "port": 8000,
+            "volumes": [f"{data_dir}:/data"]
+        }))
+
+        s3_creds = {
+            "bucket": "test-bucket",
+            "access_key": "k",
+            "secret_key": "s",
+            "account_id": "acc"
+        }
+
+        reconcile_calls = []
+
+        def track_reconcile(name):
+            reconcile_calls.append(name)
+            return True
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "load_s3_config", return_value=s3_creds), \
+             patch.object(bover_mod, "s3_sigv4_put", return_value=(True, None)), \
+             patch.object(bover_mod, "reconcile_app_permissions", side_effect=track_reconcile):
+
+            ok, _, _, _ = bover_mod.run_app_backup(app_name, notify=False)
+            self.assertTrue(ok)
+            # Must be called at least 3 times (initial prep, post-sqlite backup, and finally block)
+            self.assertGreaterEqual(len(reconcile_calls), 3)
+
+        # Test failure scenario: reconcile must STILL run in finally: block if upload fails
+        fail_reconcile_calls = []
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "load_s3_config", return_value=s3_creds), \
+             patch.object(bover_mod, "s3_sigv4_put", side_effect=RuntimeError("S3 connection dropped")), \
+             patch.object(bover_mod, "reconcile_app_permissions", side_effect=lambda n: fail_reconcile_calls.append(n)):
+
+            with self.assertRaises(RuntimeError):
+                bover_mod.run_app_backup(app_name, notify=False)
+
+            self.assertGreaterEqual(len(fail_reconcile_calls), 2,
+                                    "reconcile_app_permissions must execute in finally: even on unexpected failure")
+
+    def test_cron_job_ephemeral_run_injects_group_add_regression(self):
+        """
+        Verify that execute_cron_job in 'run' mode injects --group-add {bover_gid}.
+        """
+        app_name = "cronapp"
+        app_dir = self.apps_dir / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "app.json").write_text(json.dumps({
+            "name": app_name,
+            "domain": "cron.test",
+            "port": 8000
+        }))
+
+        job = {
+            "id": "nightly-cleanup",
+            "command": "python manage.py purge",
+            "schedule": "0 2 * * *",
+            "mode": "run"
+        }
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch.object(bover_mod, "get_bover_gid", return_value=987), \
+             patch.object(bover_mod, "get_or_create_app_user", return_value=("app_cronapp", 2099)), \
+             patch.object(bover_mod, "run_cmd", return_value="OK"), \
+             patch("subprocess.run") as mock_run:
+
+            import subprocess
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="done")
+
+            res = bover_mod.execute_cron_job(app_name, job)
+            self.assertEqual(res["status"], "SUCCESS")
+
+            called_args = mock_run.call_args[0][0]
+            self.assertIn("--group-add", called_args)
+            idx = called_args.index("--group-add")
+            self.assertEqual(called_args[idx + 1], "987")
+
+
 if __name__ == "__main__":
     unittest.main()

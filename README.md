@@ -732,6 +732,6 @@ make test
 ./lamo telegram test             # Dispatch a test notification alert
 
 # Local Development & Testing
-make test                        # Run automated unit test suite (49 tests)
+make test                        # Run automated unit test suite (56 tests)
 make clean                       # Clean bytecode, pycache and temporary files
 ```

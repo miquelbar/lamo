@@ -29,7 +29,9 @@ case "${ACTION}" in
 
         # Create unprivileged system user if it does not exist
         if ! id "${APP_USER}" >/dev/null 2>&1; then
-            useradd -r -s /usr/sbin/nologin -d "${APP_DIR}" -u "${UID_VAL}" "${APP_USER}" 2>/dev/null || true
+            useradd -r -s /usr/sbin/nologin -d "${APP_DIR}" -u "${UID_VAL}" -G bover "${APP_USER}" 2>/dev/null || true
+        else
+            usermod -a -G bover "${APP_USER}" 2>/dev/null || true
         fi
 
         # Ensure directory exists within /opt/apps
@@ -38,6 +40,11 @@ case "${ACTION}" in
         # Strictly set ownership and permissions (group write allows bover daemon state & config tracking)
         chown -R "${APP_USER}:bover" "${APP_DIR}"
         chmod 770 "${APP_DIR}"
+        if [[ -d "${APP_DIR}/data" ]]; then
+            chmod 2770 "${APP_DIR}/data"
+            find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
+            find "${APP_DIR}/data" -type d -exec chmod 2770 {} + 2>/dev/null || true
+        fi
         if [[ -f "${APP_DIR}/app.json" ]]; then
             chmod 660 "${APP_DIR}/app.json"
         fi
@@ -54,16 +61,26 @@ case "${ACTION}" in
     chown-app)
         # Safely re-chown app directory to app_<clean_name>:bover
         if [[ -d "${APP_DIR}" ]]; then
+            # Ensure user is in bover group
+            if id "${APP_USER}" >/dev/null 2>&1; then
+                usermod -a -G bover "${APP_USER}" 2>/dev/null || true
+            fi
             chown -R "${APP_USER}:bover" "${APP_DIR}"
             chmod 770 "${APP_DIR}"
             if [[ -d "${APP_DIR}/data" ]]; then
-                chmod 770 "${APP_DIR}/data"
+                chmod 2770 "${APP_DIR}/data"
                 find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
-                find "${APP_DIR}/data" -type d -exec chmod 770 {} + 2>/dev/null || true
+                find "${APP_DIR}/data" -type d -exec chmod 2770 {} + 2>/dev/null || true
             fi
             if [[ -f "${APP_DIR}/app.json" ]]; then
                 chmod 660 "${APP_DIR}/app.json"
             fi
+            # Allow bover group read-write access to deployment lock and state files
+            for f in "${APP_DIR}"/.*lock* "${APP_DIR}"/.*state* "${APP_DIR}"/.bover* "${APP_DIR}"/app.json; do
+                if [[ -e "${f}" ]]; then
+                    chmod 660 "${f}" 2>/dev/null || true
+                fi
+            done
             echo "OK: Ownership refreshed on '${APP_DIR}'."
         fi
         ;;

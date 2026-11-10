@@ -207,8 +207,13 @@ class TestBoverStateAndConfig(unittest.TestCase):
                 if "[Service]" in unit_content:
                     self.assertIn("User=bover", unit_content)
                     self.assertIn("Group=bover", unit_content)
-                    self.assertIn("NoNewPrivileges=true", unit_content)
                     self.assertIn("ProtectSystem=strict", unit_content)
+                    # Services that invoke scoped sudo helper (bover-backup, bover-autodeploy)
+                    # must NOT have NoNewPrivileges=true so kernel allows sudo execution
+                    if "bover backup all" in unit_content or "bover autodeploy" in unit_content:
+                        self.assertNotIn("NoNewPrivileges=true", unit_content)
+                    else:
+                        self.assertIn("NoNewPrivileges=true", unit_content)
 
 
 class TestBoverVaultAndIsolation(unittest.TestCase):

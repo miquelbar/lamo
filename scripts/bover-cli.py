@@ -74,7 +74,7 @@ def validate_app_name(name: str) -> str:
     return name
 
 
-def run_cmd(cmd, check=True, capture=False, cwd=None):
+def run_cmd(cmd, check=True, capture=False, cwd=None, timeout=None):
     """Execute shell command cleanly."""
     res = subprocess.run(
         cmd,
@@ -82,6 +82,7 @@ def run_cmd(cmd, check=True, capture=False, cwd=None):
         check=check,
         cwd=cwd,
         text=True,
+        timeout=timeout,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
@@ -550,6 +551,36 @@ WantedBy=timers.target
     Path("/etc/systemd/system/bover-cron.service").write_text(cron_service)
     Path("/etc/systemd/system/bover-cron.timer").write_text(cron_timer)
 
+    # 7. Automated daily security & CVE audit (runs daily at 05:00 UTC)
+    audit_service = """[Unit]
+Description=Bover Daily Application Security & CVE Auditor
+After=docker.service network.target
+
+[Service]
+Type=oneshot
+User=bover
+Group=bover
+WorkingDirectory=/opt/apps
+ExecStart=/usr/local/bin/bover audit --notify
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/apps /tmp
+"""
+    audit_timer = """[Unit]
+Description=Bover Daily Application Security & CVE Audit Timer (05:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+"""
+    Path("/etc/systemd/system/bover-audit.service").write_text(audit_service)
+    Path("/etc/systemd/system/bover-audit.timer").write_text(audit_timer)
+
     # Clean up obsolete legacy units if present
     legacy_units = [
         "pages-gateway.service", "lamo-gateway.service",
@@ -575,7 +606,8 @@ WantedBy=timers.target
     run_cmd("systemctl enable --now bover-autodeploy.timer 2>/dev/null || true")
     run_cmd("systemctl enable --now bover-backup.timer 2>/dev/null || true")
     run_cmd("systemctl enable --now bover-cron.timer 2>/dev/null || true")
-    print("==> Hardened systemd units installed: bover-gateway, bover-app@<name>, bover-metrics.timer, bover-autodeploy.timer, bover-backup.timer, bover-cron.timer.")
+    run_cmd("systemctl enable --now bover-audit.timer 2>/dev/null || true")
+    print("==> Hardened systemd units installed: bover-gateway, bover-app@<name>, bover-metrics.timer, bover-autodeploy.timer, bover-backup.timer, bover-cron.timer, bover-audit.timer.")
 
 
 def enable_app_systemd(name):
@@ -2043,6 +2075,36 @@ def init_db():
                 PRIMARY KEY (app, job_id)
             )
         """)
+
+        # Automated backup retry queue (supports 3 retries spaced 1h apart over 3h)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS backup_retries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                next_retry_ts INTEGER NOT NULL,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_backup_retries_status ON backup_retries(status, next_retry_ts)")
+
+        # Application security & CVE audit history
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                app TEXT NOT NULL,
+                critical_count INTEGER NOT NULL DEFAULT 0,
+                high_count INTEGER NOT NULL DEFAULT 0,
+                vulns_json TEXT,
+                git_behind INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_app_audits_app_ts ON app_audits(app, timestamp DESC)")
 
 
 def record_deployment_start(app, commit_hash, commit_msg, slot, triggered_by, domain):
@@ -4910,7 +4972,7 @@ def cmd_backup_prune(app_name: Optional[str] = None, keep_days: int = 5):
         print(f"✓ Pruned {pruned} old local backup archive(s) across all applications (freed {format_bytes(freed)}, retaining last {keep_days} days).")
 
 
-def notify_backup_result(app_name: str, success: bool, destination_key: Optional[str] = None, file_size_bytes: int = 0, error: Optional[str] = None, duration: float = 0.0, integrity_summary: Optional[str] = None):
+def notify_backup_result(app_name: str, success: bool, destination_key: Optional[str] = None, file_size_bytes: int = 0, error: Optional[str] = None, duration: float = 0.0, integrity_summary: Optional[str] = None, retry_info: Optional[Dict[str, Any]] = None):
     """Notify operator via Telegram with Es Bover avatar."""
     hostname = run_cmd("hostname", capture=True) or "server"
     status_icon = "✅" if success else "❌"
@@ -4935,6 +4997,11 @@ def notify_backup_result(app_name: str, success: bool, destination_key: Optional
         text += f"⏱️ <b>Duración:</b> <code>{dur_str}</code>\n"
     if error:
         text += f"\n<blockquote>⚠️ <b>Error:</b> <code>{html.escape(str(error))}</code></blockquote>\n"
+    if retry_info:
+        retry_time = datetime.fromtimestamp(retry_info["next_retry_ts"], timezone.utc).strftime("%H:%M UTC")
+        att = retry_info.get("attempt", 1)
+        max_att = retry_info.get("max_attempts", 3)
+        text += f"🔄 <b>Reintento programado:</b> Intento <b>{att}/{max_att}</b> a las <b>{retry_time}</b> (en 1 hora).\n"
 
     text += f"\n<i>Es Bover Runtime :: Backup Engine</i>"
     send_telegram(text)
@@ -5122,14 +5189,17 @@ def notify_backup_summary(results: List[Dict[str, Any]]):
         return
     if len(results) == 1:
         r = results[0]
-        notify_backup_result(
-            app_name=r["app"],
-            success=r["success"],
-            destination_key=r.get("destination_key"),
-            file_size_bytes=r.get("file_size_bytes", 0),
-            error=r.get("error"),
-            duration=r.get("duration", 0.0),
-        )
+        kwargs = {
+            "app_name": r["app"],
+            "success": r["success"],
+            "destination_key": r.get("destination_key"),
+            "file_size_bytes": r.get("file_size_bytes", 0),
+            "error": r.get("error"),
+            "duration": r.get("duration", 0.0),
+        }
+        if r.get("retry_info") is not None:
+            kwargs["retry_info"] = r["retry_info"]
+        notify_backup_result(**kwargs)
         return
 
     hostname = run_cmd("hostname", capture=True) or "server"
@@ -5176,6 +5246,10 @@ def notify_backup_summary(results: List[Dict[str, Any]]):
             err = r.get("error") or "Unknown error"
             lines.append(f"• ❌ <code>{app}</code>: Fallo en {dur_str}")
             lines.append(f"   ↳ <blockquote>⚠️ {html.escape(str(err)[:200])}</blockquote>")
+            retry_info = r.get("retry_info")
+            if retry_info:
+                retry_time = datetime.fromtimestamp(retry_info["next_retry_ts"], timezone.utc).strftime("%H:%M UTC")
+                lines.append(f"   ↳ 🔄 <b>Reintento 1/3 programado para las {retry_time}</b> (en 1 hora)")
 
     lines.append("")
     lines.append("<i>Es Bover Runtime :: Backup Engine</i>")
@@ -5184,7 +5258,183 @@ def notify_backup_summary(results: List[Dict[str, Any]]):
     send_telegram(text)
 
 
-def run_backups_batch(app_names: List[str]) -> List[Dict[str, Any]]:
+def enqueue_backup_retry(app_name: str, error_msg: str, attempt: int = 1, delay_seconds: int = 3600, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Enqueue or update an automated backup retry in SQLite.
+    Returns retry information dict with next_retry_ts.
+    """
+    init_db()
+    now = int(now_ts if now_ts is not None else time.time())
+    next_ts = now + delay_seconds
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, attempt, max_attempts FROM backup_retries WHERE app = ? AND status = 'pending'",
+            (app_name,),
+        ).fetchone()
+        if row:
+            retry_id = row[0]
+            conn.execute(
+                "UPDATE backup_retries SET attempt = ?, next_retry_ts = ?, last_error = ? WHERE id = ?",
+                (attempt, next_ts, str(error_msg), retry_id),
+            )
+            return {"id": retry_id, "app": app_name, "attempt": attempt, "next_retry_ts": next_ts, "max_attempts": row[2]}
+        else:
+            cur = conn.execute(
+                "INSERT INTO backup_retries (app, attempt, max_attempts, next_retry_ts, last_error, created_at, status) "
+                "VALUES (?, ?, 3, ?, ?, ?, 'pending')",
+                (app_name, attempt, next_ts, str(error_msg), now),
+            )
+            return {"id": cur.lastrowid, "app": app_name, "attempt": attempt, "next_retry_ts": next_ts, "max_attempts": 3}
+
+
+def process_backup_retries(now_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Evaluate pending backup retries in SQLite. If next_retry_ts <= now,
+    execute backup, send progress Telegram notifications, and update state.
+    """
+    init_db()
+    now = int(now_ts if now_ts is not None else time.time())
+    due = []
+    with get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, app, attempt, max_attempts, next_retry_ts, last_error, created_at "
+            "FROM backup_retries WHERE status = 'pending' AND next_retry_ts <= ? "
+            "ORDER BY next_retry_ts ASC",
+            (now,),
+        ).fetchall()
+        for r in rows:
+            due.append(dict(r))
+
+    if not due:
+        return []
+
+    results = []
+    s3_cfg = load_s3_config() or {}
+    bucket = s3_cfg.get("bucket", "")
+    hostname = run_cmd("hostname", capture=True) or "server"
+
+    for r in due:
+        retry_id = r["id"]
+        app = r["app"]
+        attempt = r["attempt"]
+        max_attempts = r["max_attempts"]
+
+        print(f"==> Processing scheduled backup retry {attempt}/{max_attempts} for '{app}'...")
+        success, r2_key_or_err, file_size, duration = run_app_backup(app, notify=False)
+
+        if success:
+            with get_db() as conn:
+                conn.execute("UPDATE backup_retries SET status = 'success' WHERE id = ?", (retry_id,))
+            dest_key = f"r2://{bucket}/{r2_key_or_err}"
+            msg = (
+                f"💾 <b>ES BOVER · COPIA DE SEGURIDAD RECUPERADA</b>\n"
+                f"<i>Reintento completado con éxito tras fallo previo</i>\n\n"
+                f"🖥️  <b>Nodo:</b> <code>{hostname}</code>\n"
+                f"📦 <b>App:</b> <code>{app}</code>\n"
+                f"✅ <b>Estado:</b> Completada con éxito en el reintento <b>{attempt}/{max_attempts}</b>\n"
+                f"📦 <b>Tamaño:</b> <code>{format_bytes(file_size)}</code>\n"
+                f"⏱️ <b>Tiempo:</b> <code>{duration:.1f}s</code>\n"
+                f"📁 <b>Destino:</b> <code>{dest_key}</code>\n\n"
+                f"<i>Es Bover Runtime :: Backup Engine</i>"
+            )
+            send_telegram(msg)
+            results.append({"app": app, "status": "success", "attempt": attempt})
+        else:
+            next_attempt = attempt + 1
+            if next_attempt <= max_attempts:
+                next_ts = now + 3600
+                retry_time_str = datetime.fromtimestamp(next_ts, timezone.utc).strftime("%H:%M UTC")
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE backup_retries SET attempt = ?, next_retry_ts = ?, last_error = ? WHERE id = ?",
+                        (next_attempt, next_ts, str(r2_key_or_err), retry_id),
+                    )
+                msg = (
+                    f"⚠️ <b>ES BOVER · REINTENTO DE COPIA FALLIDO</b>\n"
+                    f"<i>Fallo en reintento programado</i>\n\n"
+                    f"🖥️  <b>Nodo:</b> <code>{hostname}</code>\n"
+                    f"📦 <b>App:</b> <code>{app}</code>\n"
+                    f"❌ <b>Error:</b>\n<blockquote>{html.escape(str(r2_key_or_err)[:200])}</blockquote>\n"
+                    f"🔄 <b>Próximo reintento:</b> Intento <b>{next_attempt}/{max_attempts}</b> programado para las <b>{retry_time_str}</b> (en 1 hora).\n\n"
+                    f"<i>Es Bover Runtime :: Backup Engine</i>"
+                )
+                send_telegram(msg)
+                results.append({"app": app, "status": "retrying", "attempt": next_attempt, "next_retry_ts": next_ts})
+            else:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE backup_retries SET status = 'abandoned', last_error = ? WHERE id = ?",
+                        (str(r2_key_or_err), retry_id),
+                    )
+                msg = (
+                    f"🚨 <b>ES BOVER · ALERTA CRÍTICA: COPIA DE SEGURIDAD ABANDONADA</b>\n"
+                    f"<i>La copia de seguridad ha fallado definitivamente</i>\n\n"
+                    f"🖥️  <b>Nodo:</b> <code>{hostname}</code>\n"
+                    f"📦 <b>App:</b> <code>{app}</code>\n"
+                    f"❌ <b>Error persistente:</b>\n<blockquote>{html.escape(str(r2_key_or_err)[:200])}</blockquote>\n"
+                    f"🛑 <b>Intentos realizados:</b> Se realizaron <b>{max_attempts} reintentos</b> espaciados en {max_attempts} horas sin éxito.\n"
+                    f"⚠️ <b>Acción requerida:</b> Se requiere intervención manual. Verifica almacenamiento S3/R2 o conectividad.\n\n"
+                    f"<i>Es Bover Runtime :: Backup Engine</i>"
+                )
+                send_telegram(msg)
+                results.append({"app": app, "status": "abandoned", "attempt": attempt})
+
+    return results
+
+
+def cmd_backup_retries():
+    """List pending and historical automated backup retries."""
+    init_db()
+    with get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, app, attempt, max_attempts, next_retry_ts, last_error, created_at, status "
+            "FROM backup_retries ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+
+    if not rows:
+        print("No active or historical backup retries recorded.")
+        return
+
+    now = int(time.time())
+    headers = ["ID", "App", "Attempt", "Status", "Scheduled / Finished", "Last Error"]
+    table_rows = []
+    for r in rows:
+        st = r["status"]
+        if st == "pending":
+            sec_left = r["next_retry_ts"] - now
+            time_str = datetime.fromtimestamp(r["next_retry_ts"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if sec_left > 0:
+                mins = int(sec_left // 60)
+                sched_str = f"{time_str} (in {mins}m)"
+            else:
+                sched_str = f"{time_str} (due now)"
+            st_color = f"{GOLD}pending{RESET}"
+        elif st == "success":
+            sched_str = "Recovered"
+            st_color = f"{GREEN}success{RESET}"
+        else:
+            sched_str = "Abandoned"
+            st_color = f"{RED}abandoned{RESET}"
+
+        err = (r["last_error"] or "")[:40]
+        table_rows.append([
+            str(r["id"]),
+            r["app"],
+            f"{r['attempt']}/{r['max_attempts']}",
+            st_color,
+            sched_str,
+            err,
+        ])
+    hdr, sep, r_lines = format_table(headers, table_rows)
+    print(hdr)
+    print(sep)
+    for r in r_lines:
+        print(r)
+
+
+def run_backups_batch(app_names: List[str], is_automated: bool = True) -> List[Dict[str, Any]]:
     """
     Run backups sequentially for multiple applications on this server node,
     and deliver a single consolidated Telegram notification for the whole server.
@@ -5197,6 +5447,9 @@ def run_backups_batch(app_names: List[str]) -> List[Dict[str, Any]]:
         success, r2_key_or_err, file_size, duration = run_app_backup(app, notify=False)
         dest_key = f"r2://{bucket}/{r2_key_or_err}" if success else None
         error = None if success else r2_key_or_err
+        retry_info = None
+        if not success and is_automated:
+            retry_info = enqueue_backup_retry(app, error, attempt=1, delay_seconds=3600)
         results.append({
             "app": app,
             "success": success,
@@ -5204,6 +5457,7 @@ def run_backups_batch(app_names: List[str]) -> List[Dict[str, Any]]:
             "file_size_bytes": file_size,
             "error": error,
             "duration": duration,
+            "retry_info": retry_info,
         })
     notify_backup_summary(results)
     return results
@@ -5805,9 +6059,17 @@ def cron_tick(now_ts: Optional[int] = None) -> List[Dict[str, Any]]:
     Evaluate all configured cron jobs across all applications for the current minute tick.
     Includes a 15-minute catch-up window using 'cron_state' in SQLite so delayed systemd ticks
     or brief reboots never drop a scheduled task and never double-execute within the same minute.
+    Also processes any due automated backup retries.
     """
     init_db()
     now = int(now_ts if now_ts is not None else time.time())
+
+    # Evaluate and process any scheduled backup retries due at this tick
+    try:
+        process_backup_retries(now_ts=now)
+    except Exception as e:
+        print(f"[Backup Retry] Error checking retry queue: {e}", file=sys.stderr)
+
     current_slot_ts = (now // 60) * 60
 
     configs = get_all_app_configs()
@@ -6187,6 +6449,270 @@ def cron_show(run_id: int):
 
 
 # ==============================================================================
+# 6.9. APPLICATION SECURITY & CVE AUDITOR, AND SYSTEM UPGRADE NOTIFIER
+# ==============================================================================
+
+def audit_app(name: str, notify: bool = False) -> Dict[str, Any]:
+    """
+    Audit an application for known CVEs using Trivy and check for upstream git updates.
+    Returns audit summary dict.
+    """
+    validate_app_name(name)
+    cfg = load_app_config(name)
+    if not cfg:
+        return {
+            "app": name,
+            "error": f"Application '{name}' not found in {APPS_DIR}",
+            "critical_count": 0,
+            "high_count": 0,
+            "cves": [],
+            "git_behind": 0,
+        }
+
+    app_dir = APPS_DIR / name
+    container = _resolve_active_container_for_cron(name)
+    image_name = f"{name}:latest"
+    if container:
+        try:
+            inspect_img = run_cmd(f"docker inspect --format '{{{{.Config.Image}}}}' {container}", capture=True)
+            if inspect_img and inspect_img.strip():
+                image_name = inspect_img.strip()
+        except Exception:
+            pass
+
+    cves = []
+    trivy_bin = shutil.which("trivy")
+    if trivy_bin:
+        try:
+            # Scan container image for HIGH and CRITICAL vulnerabilities with available fixes
+            cmd = f"{trivy_bin} image --cache-dir {APPS_DIR}/.cache/trivy --severity HIGH,CRITICAL --ignore-unfixed --format json {image_name}"
+            out = run_cmd(cmd, capture=True, cwd=APPS_DIR)
+            if out:
+                data = json.loads(out)
+                for res in data.get("Results", []):
+                    for v in res.get("Vulnerabilities", []):
+                        cves.append({
+                            "id": v.get("VulnerabilityID", "UNKNOWN"),
+                            "severity": v.get("Severity", "UNKNOWN"),
+                            "package": v.get("PkgName", "unknown"),
+                            "installed": v.get("InstalledVersion", "unknown"),
+                            "fixed": v.get("FixedVersion", "unknown"),
+                            "title": (v.get("Title") or v.get("Description") or "")[:80],
+                        })
+        except Exception as e:
+            print(f"Warning: Trivy audit error on image '{image_name}': {e}", file=sys.stderr)
+
+    # Git upstream freshness check
+    git_behind = 0
+    if (app_dir / ".git").exists():
+        try:
+            run_cmd("git fetch -q origin", cwd=app_dir, timeout=10)
+            behind_str = run_cmd("git rev-list --count HEAD..@{u} 2>/dev/null", capture=True, cwd=app_dir)
+            if behind_str and behind_str.strip().isdigit():
+                git_behind = int(behind_str.strip())
+        except Exception:
+            pass
+
+    crit_count = sum(1 for c in cves if c.get("severity") == "CRITICAL")
+    high_count = sum(1 for c in cves if c.get("severity") == "HIGH")
+
+    # Record in database
+    init_db()
+    try:
+        now_ts = int(time.time())
+        status = "vulnerable" if (crit_count > 0 or high_count > 0) else ("outdated" if git_behind > 0 else "clean")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO app_audits (timestamp, app, critical_count, high_count, vulns_json, git_behind, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now_ts, name, crit_count, high_count, json.dumps(cves), git_behind, status),
+            )
+    except Exception:
+        pass
+
+    return {
+        "app": name,
+        "image": image_name,
+        "trivy_available": bool(trivy_bin),
+        "critical_count": crit_count,
+        "high_count": high_count,
+        "cves": cves,
+        "git_behind": git_behind,
+    }
+
+
+def notify_audit_summary(results: List[Dict[str, Any]]):
+    """Send Telegram notification if any applications have critical/high CVEs or pending git commits."""
+    if not results:
+        return
+    vuln_apps = [r for r in results if r.get("critical_count", 0) > 0 or r.get("high_count", 0) > 0 or r.get("git_behind", 0) > 0]
+    if not vuln_apps:
+        return
+
+    hostname = run_cmd("hostname", capture=True) or "server"
+    total_crit = sum(r.get("critical_count", 0) for r in results)
+    total_high = sum(r.get("high_count", 0) for r in results)
+    total_behind = sum(r.get("git_behind", 0) for r in results)
+
+    lines = [
+        "🛡️ <b>ES BOVER · AUDITORÍA DE SEGURIDAD (CVE DETECTADOS)</b>",
+        "<i>Análisis de vulnerabilidades e imágenes de contenedor</i>\n",
+        f"🖥️  <b>Nodo:</b> <code>{hostname}</code>",
+        f"📊 <b>Resumen:</b> 🔴 {total_crit} Críticos | 🟠 {total_high} Altos con parche disponible",
+    ]
+    if total_behind > 0:
+        lines.append(f"🔄 <b>Actualizaciones de código:</b> {total_behind} commit(s) pendientes upstream")
+    lines.append("")
+    lines.append("<b>Detalle por aplicación:</b>")
+
+    for r in vuln_apps:
+        app = r["app"]
+        crit = r.get("critical_count", 0)
+        high = r.get("high_count", 0)
+        img = r.get("image", "")
+        behind = r.get("git_behind", 0)
+
+        lines.append(f"• 📦 <code>{app}</code> (<code>{img}</code>):")
+        if crit or high:
+            lines.append(f"   ↳ 🔴 {crit} Crítico(s) | 🟠 {high} Alto(s)")
+            for cve in r.get("cves", [])[:3]:
+                c_id = cve.get("id", "CVE")
+                pkg = cve.get("package", "pkg")
+                inst = cve.get("installed", "")
+                fix = cve.get("fixed", "")
+                sev = cve.get("severity", "")
+                lines.append(f"      • <code>{c_id}</code> ({sev}) en <code>{pkg}</code> ({inst} ➔ <b>{fix}</b>)")
+            if len(r.get("cves", [])) > 3:
+                lines.append(f"      • <i>...y {len(r['cves']) - 3} vulnerabilidad(es) más.</i>")
+        if behind > 0:
+            lines.append(f"   ↳ 🔄 <b>{behind} commit(s) pendientes</b> en el repositorio upstream.")
+        lines.append(f"   ↳ 💡 <i>Ejecuta: <code>./lamo app deploy {app}</code> para reconstruir con los parches.</i>")
+        lines.append("")
+
+    lines.append("<i>Es Bover Security :: Vulnerability Auditor</i>")
+    send_telegram("\n".join(lines))
+
+
+def cmd_audit(app_name: Optional[str] = None, notify: bool = False):
+    """CLI handler for 'bover audit [app]'."""
+    trivy_bin = shutil.which("trivy")
+    if not trivy_bin:
+        print(f"{GOLD}Notice: 'trivy' is not installed on this node. Auditing git updates and repository freshness only.{RESET}")
+        print(f"Run provisioner or install trivy in /usr/local/bin/trivy to enable deep container CVE scanning.\n")
+
+    if app_name:
+        results = [audit_app(app_name, notify=notify)]
+    else:
+        configs = get_all_app_configs()
+        results = []
+        for cfg_path in configs:
+            try:
+                with open(cfg_path) as f:
+                    d = json.load(f)
+                name = d.get("name")
+                if name:
+                    results.append(audit_app(name, notify=notify))
+            except Exception:
+                pass
+
+    if not results:
+        print("No applications found to audit.")
+        return
+
+    # Print results in terminal
+    for r in results:
+        app = r["app"]
+        img = r.get("image", "")
+        crit = r.get("critical_count", 0)
+        high = r.get("high_count", 0)
+        behind = r.get("git_behind", 0)
+        cves = r.get("cves", [])
+
+        print(f"==> Security audit for '{app}' (image: {img}):")
+        if behind > 0:
+            print(f"  • Upstream Git: 🟡 {behind} commit(s) behind remote (update available)")
+        else:
+            print(f"  • Upstream Git: 🟢 Up to date with remote")
+
+        if crit == 0 and high == 0:
+            if r.get("trivy_available"):
+                print(f"  • Container CVEs: 🟢 Clean (no HIGH or CRITICAL CVEs with fixes)")
+            else:
+                print(f"  • Container CVEs: ⚪ Scanner unavailable (trivy not found)")
+        else:
+            print(f"  • Container CVEs: 🔴 {crit} Critical | 🟠 {high} High with patches available:")
+            headers = ["CVE ID", "Severity", "Package", "Installed", "Fixed In"]
+            rows = []
+            for c in cves:
+                sev_color = RED if c["severity"] == "CRITICAL" else GOLD
+                rows.append([
+                    c["id"],
+                    f"{sev_color}{c['severity']}{RESET}",
+                    c["package"],
+                    c["installed"],
+                    f"{GREEN}{c['fixed']}{RESET}",
+                ])
+            hdr, sep, r_lines = format_table(headers, rows)
+            print(f"  {hdr}")
+            print(f"  {sep}")
+            for r_line in r_lines:
+                print(f"  {r_line}")
+            print(f"  💡 Run './lamo app deploy {app}' to rebuild container with latest security patches.")
+        print("")
+
+    if notify:
+        notify_audit_summary(results)
+
+
+def cmd_system_notify_upgrades():
+    """
+    Invoked by unattended-upgrades Post-Invoke hook.
+    Detects if security packages were applied or if reboot is required,
+    and sends a Telegram notification.
+    """
+    hostname = run_cmd("hostname", capture=True) or "server"
+    reboot_required = Path("/var/run/reboot-required").exists()
+    reboot_pkgs = []
+    reboot_pkgs_file = Path("/var/run/reboot-required.pkgs")
+    if reboot_pkgs_file.exists():
+        try:
+            reboot_pkgs = [p.strip() for p in reboot_pkgs_file.read_text().splitlines() if p.strip()]
+        except Exception:
+            pass
+
+    log_file = Path("/var/log/unattended-upgrades/unattended-upgrades.log")
+    recent_pkgs = []
+    if log_file.exists():
+        try:
+            lines = log_file.read_text().splitlines()[-30:]
+            for l in lines:
+                if "Packages that will be upgraded:" in l or "Installing " in l:
+                    recent_pkgs.append(l.strip())
+        except Exception:
+            pass
+
+    # Only send notification if a reboot is required or packages were installed/upgraded
+    if not reboot_required and not recent_pkgs:
+        return
+
+    reboot_str = "⚠️ <b>Reinicio requerido:</b> Programado automáticamente a las <b>04:00 UTC</b>." if reboot_required else "🟢 <b>Reinicio:</b> No requerido."
+
+    lines = [
+        "🔄 <b>ES BOVER · ACTUALIZACIÓN DE SEGURIDAD DEL SERVIDOR</b>",
+        "<i>Parches de seguridad aplicados automáticamente</i>\n",
+        f"🖥️  <b>Nodo:</b> <code>{hostname}</code>",
+        "📦 <b>Estado:</b> Repositorios del sistema actualizados (Debian & Docker CE)",
+        reboot_str,
+    ]
+    if reboot_pkgs:
+        lines.append(f"\n<b>Paquetes que requieren reinicio:</b>\n<code>{', '.join(reboot_pkgs[:8])}</code>")
+
+    lines.append("\n<i>Es Bover Guardian :: System Auto-Upgrade</i>")
+    send_telegram("\n".join(lines))
+    print(f"✓ Security upgrade notification sent for node '{hostname}'.")
+
+
+# ==============================================================================
 # 7. MAIN CLI ENTRYPOINT
 # ==============================================================================
 
@@ -6313,6 +6839,9 @@ def main():
     bk_prune_p.add_argument("app", nargs="?", default=None, help="Optional application name")
     bk_prune_p.add_argument("--days", type=int, default=5, help="Number of days of local backups to retain (default: 5)")
 
+    bk_retries_p = bk_sub.add_parser("retries", aliases=["queue"], help="List pending and recent automated backup retries")
+    bk_proc_p = bk_sub.add_parser("process-retries", help="Process due automated backup retries immediately")
+
     # cron
     cron_p = subparsers.add_parser("cron", aliases=["crons"], help="Manage per-project scheduled cron jobs & execution history")
     cron_sub = cron_p.add_subparsers(dest="cron_action", help="Cron action")
@@ -6356,6 +6885,16 @@ def main():
     cron_show_p.add_argument("run_id", type=int, help="Execution run ID (#)")
 
     cron_sub.add_parser("tick", help="Internal: evaluate and run due cron jobs for the current minute")
+
+    # audit
+    audit_p = subparsers.add_parser("audit", help="Audit container CVE vulnerabilities and upstream repository patches")
+    audit_p.add_argument("app", nargs="?", default=None, help="Optional application name to audit (default: all)")
+    audit_p.add_argument("--notify", action="store_true", help="Send Telegram alert if vulnerabilities or updates are found")
+
+    # system
+    sys_p = subparsers.add_parser("system", help="System maintenance, upgrade alerts and security hooks")
+    sys_sub = sys_p.add_subparsers(dest="system_action", help="System action")
+    sys_sub.add_parser("notify-upgrades", help="Check for completed system security upgrades and dispatch Telegram notification")
 
     # utility commands
     subparsers.add_parser("sample", help="Internal: record point-in-time container metrics to SQLite")
@@ -6528,6 +7067,10 @@ def main():
                 sys.exit(1)
         elif args.backup_action in ("prune", "rotate", "clean"):
             cmd_backup_prune(getattr(args, "app", None), keep_days=getattr(args, "days", 5))
+        elif args.backup_action in ("retries", "queue"):
+            cmd_backup_retries()
+        elif args.backup_action == "process-retries":
+            process_backup_retries()
         else:
             bk_p.print_help()
     elif args.command in ("cron", "crons"):
@@ -6589,6 +7132,13 @@ def main():
             reload_caddy()
         elif act == "logs":
             tail_logs("gateway", follow=True)
+    elif args.command == "audit":
+        cmd_audit(getattr(args, "app", None), notify=getattr(args, "notify", False))
+    elif args.command == "system":
+        if getattr(args, "system_action", None) == "notify-upgrades":
+            cmd_system_notify_upgrades()
+        else:
+            sys_p.print_help()
 
 
 if __name__ == "__main__":

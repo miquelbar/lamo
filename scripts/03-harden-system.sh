@@ -47,13 +47,77 @@ sysctl --system >/dev/null
 
 echo "==> [03] Installing and configuring unattended-upgrades (automatic security updates)..."
 apt-get update -qq
-apt-get install -y -qq unattended-upgrades apt-listchanges fail2ban
+apt-get install -y -qq unattended-upgrades apt-listchanges fail2ban curl
 
 cat <<EOF > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+# Complete unattended-upgrades configuration: covers Debian security, stable updates, and Docker CE repo
+cat <<'EOF' > /etc/apt/apt.conf.d/50unattended-upgrades
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Debian,codename=${distro_codename}-updates";
+    "origin=Debian,codename=${distro_codename}";
+    "origin=Docker,label=Docker CE";
+    "origin=Docker";
+};
+
+Unattended-Upgrade::Package-Blacklist {
+};
+
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+
+// Clean up unused packages and old kernels to avoid disk space exhaustion
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Automated reboot at 04:00 UTC if kernel or core C libraries require it
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+
+// Post-upgrade hook: notify Telegram via bover when security patches are applied
+Unattended-Upgrade::Post-Invoke {
+    "if [ -x /usr/local/bin/bover ]; then sudo -u bover /usr/local/bin/bover system notify-upgrades >/dev/null 2>&1 || true; fi";
+};
+EOF
+
+# Ensure systemd timer units for unattended upgrades are enabled
+systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+echo "==> [03] Installing Trivy vulnerability scanner (app & container CVE auditor)..."
+if ! command -v trivy >/dev/null 2>&1; then
+    TRIVY_INSTALLED=false
+    ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    TRIVY_ARCH="64bit"
+    if [[ "${ARCH}" == "arm64" ]]; then
+        TRIVY_ARCH="ARM64"
+    fi
+    TRIVY_TMP="$(mktemp -d)"
+    if curl -fsSL "https://github.com/aquasecurity/trivy/releases/latest/download/trivy_Linux-${TRIVY_ARCH}.tar.gz" -o "${TRIVY_TMP}/trivy.tar.gz" 2>/dev/null; then
+        if tar -xzf "${TRIVY_TMP}/trivy.tar.gz" -C "${TRIVY_TMP}" trivy 2>/dev/null && [[ -f "${TRIVY_TMP}/trivy" ]]; then
+            install -m 0755 "${TRIVY_TMP}/trivy" /usr/local/bin/trivy
+            TRIVY_INSTALLED=true
+        fi
+    fi
+    rm -rf "${TRIVY_TMP}"
+
+    if [[ "${TRIVY_INSTALLED}" != "true" ]]; then
+        mkdir -p /etc/apt/keyrings
+        if curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key 2>/dev/null | gpg --dearmor -o /etc/apt/keyrings/trivy.gpg 2>/dev/null; then
+            echo "deb [signed-by=/etc/apt/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" > /etc/apt/sources.list.d/trivy.list
+            apt-get update -qq 2>/dev/null || true
+            apt-get install -y -qq trivy 2>/dev/null || true
+        fi
+    fi
+fi
 
 echo "==> [03] Configuring Fail2ban Telegram action and jail for SSH port ${SSH_PORT}..."
 mkdir -p /etc/fail2ban/action.d

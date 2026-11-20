@@ -93,7 +93,7 @@ To prevent giving your entire GitHub account access to the server:
 ### E. System and Kernel Hardening
 * **Sysctl:** IP spoofing protection (`rp_filter`), TCP SYN flood mitigation (`tcp_syncookies = 1`), and disabled ICMP redirect acceptance and source routing.
 * **Fail2ban:** Monitors port 2245 and bans offending IPs after 3 failed attempts for 2 hours.
-* **Unattended-upgrades:** Automatically applies Debian security patches daily.
+* **Autonomous Security Updates (Unattended-Upgrades):** Automatically installs security patches for Debian OS, Debian stable updates, and official **Docker CE** packages (`download.docker.com`). Configured with automatic unused kernel cleanup, automatic 04:00 UTC maintenance reboots when required by kernel/libc, and post-upgrade Telegram notifications.
 * **Docker Log Rotation:** Enforces a 10 MB limit (maximum 3 files) per container to prevent Docker logs from exhausting server storage.
 
 ### F. Dedicated Unprivileged Daemon User (`bover`)
@@ -642,6 +642,43 @@ To prevent backups from accumulating indefinitely and exhausting VPS disk space:
 
 # Rotate with a custom retention window (e.g. 3 days) for a specific app
 ./lamo app backup prune horify --days 3
+```
+
+### E. Resilient Backup Retries (3 Attempts Spaced 1 Hour Apart)
+Transient Cloudflare R2 timeouts, rate limits, or network blips no longer leave the node without backups:
+* **SQLite-Backed Retry State:** Failed automated backups are enqueued in `backup_retries` table in `stats.db`. No sleeping processes or blocking systemd units.
+* **1-Hour Exponential Spacing:** The minute-tick scheduler (`bover-cron.timer`) checks pending retries. If an attempt fails, it retries up to 3 times spaced 1 hour apart (attempt 1/3 at +1h, 2/3 at +2h, 3/3 at +3h).
+* **Crash & Reboot Resilient:** If the node reboots or restarts during the 3-hour retry window, the pending retry state survives and triggers immediately upon reboot.
+* **Intelligent Telegram Alerts:**
+  * When a failure occurs, notifies the operator with the scheduled next retry time (`HH:MM UTC`).
+  * If a retry succeeds, sends a recovery confirmation.
+  * If all 3 retries fail over 3 hours, dispatches a critical abandonment alert requiring manual intervention.
+
+```bash
+# Inspect active and historical backup retry queue across nodes
+./lamo app backup retries
+```
+
+---
+
+## 15.D. Application Security & Container CVE Auditor (`lamo app audit`)
+
+Containerized applications run isolated libraries and base images that standard host `apt upgrade` cannot patch. The built-in vulnerability auditor inspects active containers and git repositories:
+
+* **Trivy Vulnerability Scanner Integration:** Uses standalone `/usr/local/bin/trivy` to scan container images for known vulnerabilities.
+* **Zero Noise (`--ignore-unfixed`):** Only alerts for `CRITICAL` and `HIGH` CVEs that have an actual vendor fix or patched version available.
+* **Upstream Git Freshness:** Automatically verifies if the application's local repository in `/opt/apps/<app>` is behind `origin/main`.
+* **Daily Automated Security Sweep:** `bover-audit.timer` runs daily at 05:00 UTC and dispatches a consolidated Telegram alert if CVEs or updates are detected.
+
+```bash
+# Audit all deployed applications on the current node
+./lamo app audit
+
+# Audit a specific application
+./lamo app audit horify
+
+# Audit and dispatch Telegram alert if vulnerabilities are found
+./lamo app audit horify --notify
 ```
 
 ---

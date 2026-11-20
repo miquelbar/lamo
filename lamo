@@ -1142,6 +1142,8 @@ def cmd_app_action(base_cfg, args):
             target_app = shlex.quote(validate_app_name(app_names[0])) if app_names else ""
             days_arg = f"--days {getattr(args, 'days', 5)}" if getattr(args, "days", None) else ""
             run_ssh(cfg, f"sudo -u bover bover backup prune {target_app} {days_arg}".strip())
+        elif action_or_app in ("retries", "queue"):
+            run_ssh(cfg, "sudo -u bover bover backup retries")
         elif action_or_app == "run":
             if not app_names:
                 print("Error: Application name required for 'backup run <app...>'")
@@ -1200,6 +1202,10 @@ def cmd_app_action(base_cfg, args):
         elif c_act in ("show", "output", "inspect"):
             run_id = int(args.run_id)
             run_ssh(cfg, f"sudo -u bover bover cron show {run_id}")
+    elif action == "audit":
+        target_app = shlex.quote(validate_app_name(args.app)) if getattr(args, "app", None) else ""
+        notify_flag = "--notify" if getattr(args, "notify", False) else ""
+        run_ssh(cfg, f"sudo -u bover bover audit {target_app} {notify_flag}".strip())
 
 
 def cmd_telegram(base_cfg, args):
@@ -1426,6 +1432,10 @@ Examples:
 
     acron_p = app_sub.add_parser("cron", aliases=["crons"], help="Manage per-project scheduled cron jobs & execution history")
     _register_cron_subparsers(acron_p)
+
+    aaudit_p = app_sub.add_parser("audit", help="Audit container CVE vulnerabilities and upstream repository patches")
+    aaudit_p.add_argument("app", nargs="?", default=None, help="Specific application name to audit (default: all)")
+    aaudit_p.add_argument("--notify", action="store_true", help="Send Telegram alert if vulnerabilities or updates are found")
 
     # 3. Telegram Notifications
     tg_p = subparsers.add_parser("telegram", help="Configure or test Telegram deployment notifications")

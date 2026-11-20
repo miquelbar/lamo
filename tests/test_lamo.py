@@ -266,6 +266,7 @@ class TestLamoArgparse(unittest.TestCase):
             (["lamo", "app", "backup", "list", "myapp"], "sudo -u bover bover backup list myapp", False),
             (["lamo", "app", "backup", "verify", "myapp"], "sudo -u bover bover backup verify myapp", False),
             (["lamo", "app", "backup", "verify", "myapp", "--key", "myapp/test.tar.gz"], "sudo -u bover bover backup verify myapp --key myapp/test.tar.gz", False),
+            (["lamo", "app", "backup", "retries"], "sudo -u bover bover backup retries", False),
         ]
         for argv, expected_cmd, is_interactive in test_cases:
             with patch("sys.argv", argv), \
@@ -328,6 +329,14 @@ class TestLamoArgparse(unittest.TestCase):
              patch.object(lamo_mod, "run_ssh") as mock_ssh:
             lamo_mod.main()
             mock_ssh.assert_called_once_with(base_cfg, "sudo -u bover bover config testapp")
+
+        # 5. app audit routes to bover audit
+        with patch("sys.argv", ["lamo", "app", "audit", "testapp"]), \
+             patch.object(lamo_mod, "load_base_config", return_value=base_cfg), \
+             patch.object(lamo_mod, "resolve_active_node", return_value=(base_cfg, {})), \
+             patch.object(lamo_mod, "run_ssh") as mock_ssh:
+            lamo_mod.main()
+            mock_ssh.assert_called_once_with(base_cfg, "sudo -u bover bover audit testapp")
 
     def test_node_stats_and_apps_routing(self):
         base_cfg = {

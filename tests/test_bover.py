@@ -195,6 +195,8 @@ class TestBoverStateAndConfig(unittest.TestCase):
             self.assertIn("app_visits", tables)
             self.assertIn("cron_executions", tables)
             self.assertIn("cron_state", tables)
+            self.assertIn("backup_retries", tables)
+            self.assertIn("app_audits", tables)
 
     def test_systemd_units_least_privilege(self):
         with patch("pathlib.Path.write_text") as mock_write, \
@@ -1223,6 +1225,134 @@ services:
             self.assertIn("--group-add", called_args)
             idx = called_args.index("--group-add")
             self.assertEqual(called_args[idx + 1], "987")
+
+    def test_backup_retries_flow_success(self):
+        """Test enqueuing a backup retry and recovering upon successful retry."""
+        with patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch.object(bover_mod, "send_telegram") as mock_tg, \
+             patch.object(bover_mod, "run_app_backup", return_value=(True, "testapp/bk.tar.gz", 1024, 0.5)):
+
+            now = 1700000000
+            # Enqueue initial retry
+            ret = bover_mod.enqueue_backup_retry("testapp", "R2 connection timeout", attempt=1, delay_seconds=3600, now_ts=now)
+            self.assertEqual(ret["app"], "testapp")
+            self.assertEqual(ret["attempt"], 1)
+            self.assertEqual(ret["next_retry_ts"], now + 3600)
+
+            # Check before due time (30 mins later)
+            results = bover_mod.process_backup_retries(now_ts=now + 1800)
+            self.assertEqual(len(results), 0)
+
+            # Check at due time (60 mins later)
+            results = bover_mod.process_backup_retries(now_ts=now + 3600)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["status"], "success")
+
+            # Verify in DB
+            with bover_mod.get_db() as conn:
+                row = conn.execute("SELECT status FROM backup_retries WHERE app = 'testapp'").fetchone()
+                self.assertEqual(row[0], "success")
+
+            mock_tg.assert_called_once()
+            self.assertIn("COPIA DE SEGURIDAD RECUPERADA", mock_tg.call_args[0][0])
+
+    def test_backup_retries_repeated_failure_until_abandoned(self):
+        """Test that retries increment up to 3 attempts and are marked abandoned with critical alert."""
+        with patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch.object(bover_mod, "send_telegram") as mock_tg, \
+             patch.object(bover_mod, "run_app_backup", return_value=(False, "Persistent S3 Error", 0, 1.0)):
+
+            now = 1700000000
+            bover_mod.enqueue_backup_retry("failapp", "First Failure", attempt=1, delay_seconds=3600, now_ts=now)
+
+            # Attempt 1 -> 2 (at 1h)
+            res1 = bover_mod.process_backup_retries(now_ts=now + 3600)
+            self.assertEqual(res1[0]["status"], "retrying")
+            self.assertEqual(res1[0]["attempt"], 2)
+
+            # Attempt 2 -> 3 (at 2h)
+            res2 = bover_mod.process_backup_retries(now_ts=now + 7200)
+            self.assertEqual(res2[0]["status"], "retrying")
+            self.assertEqual(res2[0]["attempt"], 3)
+
+            # Attempt 3 -> abandoned (at 3h)
+            res3 = bover_mod.process_backup_retries(now_ts=now + 10800)
+            self.assertEqual(res3[0]["status"], "abandoned")
+
+            with bover_mod.get_db() as conn:
+                row = conn.execute("SELECT status, attempt FROM backup_retries WHERE app = 'failapp'").fetchone()
+                self.assertEqual(row[0], "abandoned")
+
+            # Last telegram call should be critical abandonment alert
+            last_msg = mock_tg.call_args[0][0]
+            self.assertIn("ALERTA CRÍTICA: COPIA DE SEGURIDAD ABANDONADA", last_msg)
+
+    def test_audit_app_trivy_and_git(self):
+        """Test application CVE auditor with mocked Trivy scanner output."""
+        app_name = "vulnapp"
+        app_dir = self.apps_dir / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "app.json").write_text(json.dumps({
+            "name": app_name,
+            "domain": "vuln.test",
+            "port": 3000
+        }))
+
+        trivy_mock_output = json.dumps({
+            "Results": [{
+                "Target": "vulnapp:latest",
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-2026-9999",
+                        "PkgName": "runc",
+                        "InstalledVersion": "1.1.11",
+                        "FixedVersion": "1.1.12",
+                        "Severity": "CRITICAL",
+                        "Title": "Container escape vulnerability"
+                    },
+                    {
+                        "VulnerabilityID": "CVE-2026-8888",
+                        "PkgName": "openssl",
+                        "InstalledVersion": "3.0.11",
+                        "FixedVersion": "3.0.13",
+                        "Severity": "HIGH",
+                        "Title": "TLS memory leak"
+                    }
+                ]
+            }]
+        })
+
+        with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "DB_PATH", self.db_path), \
+             patch("shutil.which", return_value="/usr/local/bin/trivy"), \
+             patch.object(bover_mod, "run_cmd", return_value=trivy_mock_output), \
+             patch.object(bover_mod, "send_telegram") as mock_tg:
+
+            res = bover_mod.audit_app(app_name)
+            self.assertEqual(res["critical_count"], 1)
+            self.assertEqual(res["high_count"], 1)
+            self.assertEqual(len(res["cves"]), 2)
+
+            # Test notification summary
+            bover_mod.notify_audit_summary([res])
+            mock_tg.assert_called_once()
+            msg = mock_tg.call_args[0][0]
+            self.assertIn("CVE-2026-9999", msg)
+            self.assertIn("CRITICAL", msg)
+            self.assertIn("lamo app deploy vulnapp", msg)
+
+    def test_system_notify_upgrades(self):
+        """Test system upgrade notification when reboot is required."""
+        with patch.object(bover_mod, "run_cmd", return_value="worker-1"), \
+             patch("pathlib.Path.exists", side_effect=lambda: True), \
+             patch("pathlib.Path.read_text", return_value="linux-image-6.1.0-26-amd64\nlibc6"), \
+             patch.object(bover_mod, "send_telegram") as mock_tg:
+
+            bover_mod.cmd_system_notify_upgrades()
+            mock_tg.assert_called_once()
+            msg = mock_tg.call_args[0][0]
+            self.assertIn("ACTUALIZACIÓN DE SEGURIDAD DEL SERVIDOR", msg)
+            self.assertIn("04:00 UTC", msg)
 
 
 if __name__ == "__main__":

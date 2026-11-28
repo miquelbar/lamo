@@ -18,16 +18,28 @@ CLEAN_NAME="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_' | cut -c1-18 | tr '[:uppe
 APP_USER="app_${CLEAN_NAME}"
 APP_DIR="/opt/apps/${APP_NAME}"
 
-share_git_directories() {
+share_git_permissions() {
     local git_dir="${APP_DIR}/.git"
     if [[ ! -L "${APP_DIR}" && -d "${git_dir}" && ! -L "${git_dir}" ]]; then
         # Fetch runs as bover even after the app user takes ownership.
         # Keep existing directories writable and inherit the bover group.
-        runuser -u "${APP_USER}" -- find "${git_dir}" -type d -group bover -exec chmod g+rws {} +
+        runuser -u "${APP_USER}" -- find "${git_dir}" -xdev -type d \
+            -user "${APP_USER}" -group bover ! -perm -2070 -exec chmod g+rws {} +
+        # Git opens FETCH_HEAD in place instead of replacing it with a lockfile.
+        runuser -u "${APP_USER}" -- find "${git_dir}" -maxdepth 1 -type f -name FETCH_HEAD \
+            -user "${APP_USER}" -group bover -links 1 ! -perm -0060 -exec chmod g+rw {} +
     fi
 }
 
 case "${ACTION}" in
+    git-permissions)
+        if [[ -L "${APP_DIR}" || ! -d "${APP_DIR}/.git" || -L "${APP_DIR}/.git" ]]; then
+            echo "ERROR: Expected an application checkout at '${APP_DIR}'." >&2
+            exit 1
+        fi
+        share_git_permissions
+        ;;
+
     user-create)
         UID_VAL="${3:-}"
         # Validate UID is an integer in 2001-2999 range
@@ -49,7 +61,7 @@ case "${ACTION}" in
         # Strictly set ownership and permissions (group write allows bover daemon state & config tracking)
         chown -R "${APP_USER}:bover" "${APP_DIR}"
         chmod 770 "${APP_DIR}"
-        share_git_directories
+        share_git_permissions
         if [[ -d "${APP_DIR}/data" ]]; then
             chmod 2770 "${APP_DIR}/data"
             find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
@@ -77,7 +89,7 @@ case "${ACTION}" in
             fi
             chown -R "${APP_USER}:bover" "${APP_DIR}"
             chmod 770 "${APP_DIR}"
-            share_git_directories
+            share_git_permissions
             if [[ -d "${APP_DIR}/data" ]]; then
                 chmod 2770 "${APP_DIR}/data"
                 find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
@@ -97,7 +109,7 @@ case "${ACTION}" in
         ;;
 
     *)
-        echo "Usage: $0 {user-create <app> <uid>|user-delete <app>|chown-app <app>}" >&2
+        echo "Usage: $0 {user-create <app> <uid>|user-delete <app>|chown-app <app>|git-permissions <app>}" >&2
         exit 1
         ;;
 esac

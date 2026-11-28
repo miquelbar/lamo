@@ -1004,6 +1004,29 @@ def _cleanup_stale_git_locks(git_dir: Path):
             pass
 
 
+def _git_permission_error(exc):
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return None
+    for line in (exc.stderr or "").splitlines():
+        if not line.startswith("remote:") and ".git/" in line and (
+            "insufficient permission" in line.lower() or "permission denied" in line.lower()
+        ):
+            return line.strip()
+    return None
+
+
+def _repair_git_permissions(app_dir):
+    helper = Path("/usr/local/bin/bover-helper")
+    if app_dir.parent != Path("/opt/apps") or not helper.is_file():
+        return False
+    validate_app_name(app_dir.name)
+    command = [str(helper), "git-permissions", app_dir.name]
+    if os.geteuid() != 0:
+        command = ["sudo", "-n", *command]
+    print(f"==> [AutoRecovery] Restoring Git permissions for '{app_dir.name}'.", flush=True)
+    return subprocess.run(command).returncode == 0
+
+
 def git_sync(app_dir, repo=None, branch="master"):
     """Fetch and pull latest changes from Git repository."""
     app_name = app_dir.name
@@ -1013,22 +1036,34 @@ def git_sync(app_dir, repo=None, branch="master"):
 
     git_dir = app_dir / ".git"
     _cleanup_stale_git_locks(git_dir)
+    branch_arg = shlex.quote(branch)
 
     if not git_dir.exists() and repo:
         print(f"==> Initializing and fetching repository '{repo}' ({branch})...")
         run_cmd("git init --shared=group", cwd=app_dir)
         run_cmd(f"git remote add origin {shlex.quote(repo)}", cwd=app_dir)
-        run_cmd(f"git fetch origin {branch}", cwd=app_dir)
-        run_cmd(f"git checkout -B {branch} origin/{branch}", cwd=app_dir)
+        run_cmd(f"git fetch origin {branch_arg}", cwd=app_dir)
+        run_cmd(f"git checkout -B {branch_arg} {shlex.quote(f'origin/{branch}')}", cwd=app_dir)
     elif git_dir.exists():
         print(f"==> Pulling latest changes from branch '{branch}'...")
-        run_cmd("git config --local core.sharedRepository group", cwd=app_dir)
-        run_cmd("git fetch origin", cwd=app_dir)
-        run_cmd(f"git checkout {branch}", cwd=app_dir)
+
+        def update_checkout():
+            run_cmd("LC_ALL=C git config --local core.sharedRepository group", capture=True, cwd=app_dir)
+            run_cmd("LC_ALL=C git fetch origin", capture=True, cwd=app_dir)
+            run_cmd(f"LC_ALL=C git checkout {branch_arg}", capture=True, cwd=app_dir)
+            try:
+                run_cmd(f"LC_ALL=C git pull origin {branch_arg}", capture=True, cwd=app_dir)
+            except subprocess.CalledProcessError as exc:
+                if _git_permission_error(exc) or exc.returncode in (130, 137, 143, -2, -9, -15):
+                    raise
+                run_cmd(f"git reset --hard {shlex.quote(f'origin/{branch}')}", cwd=app_dir)
+
         try:
-            run_cmd(f"git pull origin {branch}", cwd=app_dir)
-        except Exception:
-            run_cmd(f"git reset --hard origin/{branch}", cwd=app_dir)
+            update_checkout()
+        except subprocess.CalledProcessError as exc:
+            if not _git_permission_error(exc) or not _repair_git_permissions(app_dir):
+                raise
+            update_checkout()
 
     commit = "unknown"
     msg = ""
@@ -1145,6 +1180,7 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False, requested_
         existing_journal = load_deploy_journal(name)
 
         if existing_journal and (resume or triggered_by != "rollback"):
+            init_db()
             journal = existing_journal
             phase = journal.get("phase", "git_sync")
             if phase not in PHASE_ORDER:
@@ -1217,11 +1253,13 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False, requested_
                 if _is_interrupted_by_shutdown(e):
                     print(f"==> [INTERRUPT] Git sync interrupted by system shutdown; journal kept at 'git_sync'.")
                     sys.exit(143)
-                error = f"git_sync: {e}"
+                if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                    print(e.stderr.rstrip(), file=sys.stderr)
+                error = f"git_sync: {_git_permission_error(e) or e}"
                 print(f"[DEPLOYMENT FAILED] {error}")
                 record_deployment_finish(deploy_id, "FAILED", error_message=error)
                 clear_deploy_journal(name)
-                notify_git_sync_failure(name, target_slot, current_slot, commit, error, triggered_by)
+                notify_deploy_failed(name, target_slot, current_slot, commit, error, triggered_by, phase="git_sync")
                 if triggered_by == "autodeploy":
                     return False
                 sys.exit(1)
@@ -1420,7 +1458,7 @@ networks:
 
                 # Record failure in SQLite, alert Telegram & clear journal
                 record_deployment_finish(deploy_id, "FAILED", error_message=err_msg)
-                notify_deploy_failed(name, target_slot, current_slot, commit, err_msg, triggered_by)
+                notify_deploy_failed(name, target_slot, current_slot, commit, err_msg, triggered_by, phase="healthcheck")
                 clear_deploy_journal(name)
 
                 print(f"==> Tearing down failed container '{target_container}'...")
@@ -1869,6 +1907,7 @@ def remove_app(name, keep_data=False, force=False):
     init_db()
     with get_db() as conn:
         conn.execute("DELETE FROM deployments WHERE app = ?", (name,))
+        conn.execute("DELETE FROM deployment_failure_alerts WHERE app = ?", (name,))
         conn.execute("DELETE FROM app_disk_metrics WHERE app = ?", (name,))
         conn.execute("DELETE FROM app_visits WHERE app = ?", (name,))
         conn.execute("DELETE FROM cron_executions WHERE app = ?", (name,))
@@ -2024,12 +2063,23 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app, started_at DESC)")
 
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS git_sync_alerts (
-                app TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS deployment_failure_alerts (
+                app TEXT NOT NULL,
+                phase TEXT NOT NULL,
                 commit_hash TEXT NOT NULL,
-                error_message TEXT NOT NULL
+                error_message TEXT NOT NULL,
+                PRIMARY KEY (app, phase)
             )
         """)
+        legacy_alerts = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'git_sync_alerts'"
+        if conn.execute(legacy_alerts).fetchone():
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(legacy_alerts).fetchone():
+                conn.execute("""
+                    INSERT OR IGNORE INTO deployment_failure_alerts (app, phase, commit_hash, error_message)
+                    SELECT app, 'git_sync', commit_hash, error_message FROM git_sync_alerts
+                """)
+                conn.execute("DROP TABLE git_sync_alerts")
 
         # Disk consumption & differential metrics table
         conn.execute("""
@@ -2156,6 +2206,11 @@ def record_deployment_finish(deploy_id, status, error_message=None):
             SET status = ?, finished_at = ?, duration_sec = ?, error_message = ?
             WHERE id = ?
         """, (status, finished_at, duration, error_message, deploy_id))
+        if status in ("SUCCESS", "ROLLBACK"):
+            conn.execute("""
+                DELETE FROM deployment_failure_alerts
+                WHERE app = (SELECT app FROM deployments WHERE id = ?)
+            """, (deploy_id,))
         return duration
 
 
@@ -2292,26 +2347,22 @@ def notify_deploy_success(app, slot, commit, commit_msg, domain, duration, trigg
         f"<blockquote>✨ <b>Salud OK:</b> Contenedor verificado, Caddy ha transferido el 100% del tráfico sin pérdida de peticiones.</blockquote>\n\n"
         f"<i>Es Bover Runtime :: Deployer</i>"
     )
-    send_telegram(text)
+    if send_telegram(text):
+        print(f"[Telegram] Deployment success alert delivered for '{app}' ({commit_disp}).")
 
 
-def notify_git_sync_failure(app, target_slot, live_slot, commit, error, triggered_by):
-    if triggered_by != "autodeploy":
-        notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase="git_sync")
-        return
-
-    with get_db() as conn:
-        previous = conn.execute(
-            "SELECT commit_hash, error_message FROM git_sync_alerts WHERE app = ?", (app,)
-        ).fetchone()
-    if previous == (commit, error):
-        return
-    if notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase="git_sync"):
+def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase):
+    # deploy_app holds the per-app lock through delivery and persistence.
+    automatic = triggered_by == "autodeploy"
+    if automatic:
         with get_db() as conn:
-            conn.execute("INSERT OR REPLACE INTO git_sync_alerts VALUES (?, ?, ?)", (app, commit, error))
+            previous = conn.execute("""
+                SELECT commit_hash, error_message FROM deployment_failure_alerts
+                WHERE app = ? AND phase = ?
+            """, (app, phase)).fetchone()
+        if previous == (commit, error):
+            return False
 
-
-def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase=None):
     hostname = run_cmd("hostname", capture=True) or "server"
     commit_disp = commit[:7] if commit else "unknown"
     safe_app = html.escape(str(app))
@@ -2346,7 +2397,16 @@ def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_b
         f"{traffic_status}</blockquote>\n\n"
         f"<i>Es Bover Runtime :: Deployer</i>"
     )
-    return send_telegram(text)
+    delivered = send_telegram(text)
+    if delivered:
+        if automatic:
+            with get_db() as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO deployment_failure_alerts (app, phase, commit_hash, error_message)
+                    VALUES (?, ?, ?, ?)
+                """, (app, phase, commit, error))
+        print(f"[Telegram] Deployment failure alert delivered for '{app}' ({commit_disp}, {phase}).")
+    return delivered
 
 
 def configure_telegram(bot_token, chat_id, test=True):

@@ -374,6 +374,8 @@ Each application lives in `/opt/apps/<name>/` with an `app.json` file:
 ### C. Continuous Deployment via Git Polling
 When `"auto_deploy": true` is enabled, the `bover-autodeploy.timer` systemd service checks GitHub every 60 seconds using `git ls-remote` (lightweight, under 1 second). When a new commit is detected on `master`, it executes an automated Blue/Green deployment without manual intervention.
 
+If Git reports a local permission error inside `.git`, Bover uses its scoped helper to restore group access to app-owned Git directories and `FETCH_HEAD`, then retries synchronization once. CI reproduces these failures using separate Linux users and a real Git repository. Run the same harness with `sudo bash tests/git-permission-recovery.sh` on a disposable Linux host with Git, Python, and sudo.
+
 ### D. Zero-Downtime Blue/Green Deployment Strategy
 When running `./lamo deploy <app>`:
 1. **Git Sync:** Fetches latest commits with `git pull` using the isolated GitHub deploy key.

@@ -504,6 +504,7 @@ class TestBoverVaultAndIsolation(unittest.TestCase):
         (app_dir / "Dockerfile").write_text("FROM alpine\n")
 
         with patch.object(bover_mod, "APPS_DIR", self.apps_dir), \
+             patch.object(bover_mod, "DB_PATH", self.apps_dir / "resume.db"), \
              patch.object(bover_mod, "CONF_DIR", self.apps_dir / "gateway" / "conf.d"), \
              patch.object(bover_mod, "DRAIN_SECONDS", 0), \
              patch.object(bover_mod, "get_or_create_app_user", return_value=("app-resumetest", 2001)), \
@@ -537,6 +538,8 @@ class TestBoverVaultAndIsolation(unittest.TestCase):
 
             ok = bover_mod.deploy_app("resumetest", resume=True)
             self.assertTrue(ok)
+            with bover_mod.get_db() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM deployment_failure_alerts").fetchone(), (0,))
             # git_sync and docker build must be skipped since checkpoint was already at 'healthcheck'
             mock_git.assert_not_called()
             executed_cmds = [c[0][0] for c in mock_cmd.call_args_list]
@@ -913,6 +916,49 @@ class TestBoverCronScheduler(unittest.TestCase):
 
 
 class TestGitSyncDeployment(unittest.TestCase):
+    def test_automatic_failure_alerts_distinguish_phases_and_reset_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(bover_mod, "DB_PATH", Path(tmp) / "test.db"), \
+             patch.object(bover_mod, "run_cmd", return_value="node"), \
+             patch.object(bover_mod, "send_telegram", return_value=True) as telegram:
+            with bover_mod.get_db() as db:
+                db.execute("CREATE TABLE git_sync_alerts (app TEXT PRIMARY KEY, commit_hash TEXT, error_message TEXT)")
+                db.execute("INSERT INTO git_sync_alerts VALUES ('demo', '2222222', 'same failure')")
+            deploy_id = bover_mod.record_deployment_start("demo", "2222222", "", "blue", "autodeploy", "demo.example")
+            args = ("demo", "blue", "green", "2222222", "same failure")
+
+            bover_mod.notify_deploy_failed(*args, "autodeploy", phase="git_sync")
+            telegram.assert_not_called()
+            for phase in ("build", "healthcheck", "build", "healthcheck"):
+                bover_mod.notify_deploy_failed(*args, "autodeploy", phase=phase)
+            self.assertEqual(telegram.call_count, 2)
+            self.assertIn("construcción", telegram.call_args_list[0].args[0])
+            self.assertIn("Healthcheck fallido", telegram.call_args_list[1].args[0])
+
+            bover_mod.notify_deploy_failed(*args, "cli", phase="build")
+            self.assertEqual(telegram.call_count, 3)
+            bover_mod.record_deployment_finish(deploy_id, "SUCCESS")
+            bover_mod.notify_deploy_success("demo", "blue", "2222222", "", "demo.example", 1, "autodeploy")
+            self.assertIn("DESPLIEGUE EXITOSO", telegram.call_args.args[0])
+            bover_mod.notify_deploy_failed(*args, "autodeploy", phase="build")
+            self.assertEqual(telegram.call_count, 5)
+
+    def test_git_permission_recovery_is_attempted_once_and_only_for_local_permissions(self):
+        for stderr, retries in (
+            ("error: insufficient permission for adding an object to repository database .git/objects", 1),
+            ("git@github.com: Permission denied (publickey).", 0),
+        ):
+            with self.subTest(stderr=stderr), tempfile.TemporaryDirectory() as tmp:
+                checkout = Path(tmp)
+                (checkout / ".git").mkdir()
+                error = subprocess.CalledProcessError(128, "git fetch origin", stderr=stderr)
+                with patch.object(bover_mod, "run_cmd", side_effect=[None, error] * (1 + retries)) as command, \
+                     patch.object(bover_mod, "_repair_git_permissions", return_value=True) as repair:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        bover_mod.git_sync(checkout)
+                    self.assertEqual(repair.call_count, retries)
+                    self.assertEqual(command.call_count, 2 * (1 + retries))
+
     def test_git_failure_is_audited_and_alert_is_retried_then_deduplicated(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(bover_mod, "APPS_DIR", Path(tmp)), \

@@ -33,3 +33,6 @@ jobs:
       - name: Run unit test suite
         run: |
           make test
+
+      - name: Reproduce and verify Git permission recovery as separate users
+        run: sudo bash tests/git-permission-recovery.sh

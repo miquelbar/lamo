@@ -9,6 +9,8 @@ import sys
 import os
 import json
 import sqlite3
+import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -908,6 +910,63 @@ class TestBoverCronScheduler(unittest.TestCase):
             self.assertEqual(len(res3), 1)
             self.assertEqual(mock_exec.call_count, 2)
             self.assertEqual(mock_exec.call_args[0][2], "catchup")
+
+
+class TestGitSyncDeployment(unittest.TestCase):
+    def test_git_failure_is_audited_and_alert_is_retried_then_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(bover_mod, "APPS_DIR", Path(tmp)), \
+             patch.object(bover_mod, "DB_PATH", Path(tmp) / "test.db"), \
+             patch.object(bover_mod, "get_or_create_app_user", return_value=("app_demo", 2001)), \
+             patch.object(bover_mod, "git_sync", side_effect=subprocess.CalledProcessError(128, "git fetch origin")), \
+             patch.object(bover_mod, "run_cmd", return_value="node") as command, \
+             patch.object(bover_mod, "send_telegram", side_effect=[False, True, True]) as telegram:
+            app_dir = Path(tmp) / "demo"
+            app_dir.mkdir()
+            (app_dir / "app.json").write_text(json.dumps({"name": "demo", "domain": "demo.example", "port": 80}))
+            bover_mod.save_app_state("demo", {"active_slot": "green", "commit": "1111111"})
+
+            for commit in ("2222222", "2222222", "2222222", "3333333"):
+                self.assertFalse(bover_mod.deploy_app("demo", triggered_by="autodeploy", requested_commit=commit))
+
+            with bover_mod.get_db() as db:
+                attempts = db.execute(
+                    "SELECT commit_hash, slot, status, error_message FROM deployments ORDER BY id"
+                ).fetchall()
+            self.assertEqual([row[:3] for row in attempts], [
+                ("2222222", "blue", "FAILED"),
+                ("2222222", "blue", "FAILED"),
+                ("2222222", "blue", "FAILED"),
+                ("3333333", "blue", "FAILED"),
+            ])
+            self.assertTrue(all(row[3].startswith("git_sync:") and "git fetch" in row[3] for row in attempts))
+            self.assertEqual(telegram.call_count, 3)
+            self.assertIn("antes de construir", telegram.call_args_list[0].args[0])
+            self.assertIn("3333333", telegram.call_args_list[-1].args[0])
+            self.assertTrue(all(call.args == ("hostname",) for call in command.call_args_list))
+            self.assertEqual(bover_mod.load_app_state("demo")["commit"], "1111111")
+            self.assertIsNone(bover_mod.load_deploy_journal("demo"))
+
+    def test_git_sync_configures_existing_and_new_checkouts_for_shared_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=upstream, check=True)
+            subprocess.run([
+                "git", "-c", "user.name=Bover Test", "-c", "user.email=bover@example.test",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Initial",
+            ], cwd=upstream, check=True)
+
+            checkout = root / "demo"
+            checkout.mkdir()
+            first_commit, _ = bover_mod.git_sync(checkout, str(upstream), "main")
+            self.assertTrue((checkout / ".git" / "objects").stat().st_mode & stat.S_IWGRP)
+            subprocess.run(["git", "config", "--unset", "core.sharedRepository"], cwd=checkout, check=True)
+            second_commit, _ = bover_mod.git_sync(checkout, str(upstream), "main")
+            self.assertEqual(first_commit, second_commit)
+            config = subprocess.check_output(["git", "config", "--get", "core.sharedRepository"], cwd=checkout, text=True)
+            self.assertEqual(config.strip(), "group")
 
 
 class TestBoverPermissionAndIsolationRegression(unittest.TestCase):

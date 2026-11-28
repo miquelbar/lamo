@@ -1016,12 +1016,13 @@ def git_sync(app_dir, repo=None, branch="master"):
 
     if not git_dir.exists() and repo:
         print(f"==> Initializing and fetching repository '{repo}' ({branch})...")
-        run_cmd("git init", cwd=app_dir)
+        run_cmd("git init --shared=group", cwd=app_dir)
         run_cmd(f"git remote add origin {shlex.quote(repo)}", cwd=app_dir)
         run_cmd(f"git fetch origin {branch}", cwd=app_dir)
         run_cmd(f"git checkout -B {branch} origin/{branch}", cwd=app_dir)
     elif git_dir.exists():
         print(f"==> Pulling latest changes from branch '{branch}'...")
+        run_cmd("git config --local core.sharedRepository group", cwd=app_dir)
         run_cmd("git fetch origin", cwd=app_dir)
         run_cmd(f"git checkout {branch}", cwd=app_dir)
         try:
@@ -1089,7 +1090,7 @@ def run_healthcheck(container_name, port, path, timeout=30):
 PHASE_ORDER = ["git_sync", "build", "healthcheck", "switch_traffic", "drain_cleanup"]
 
 
-def deploy_app(name, no_pull=False, triggered_by="cli", resume=False):
+def deploy_app(name, no_pull=False, triggered_by="cli", resume=False, requested_commit=None):
     """
     Execute a full Zero-Downtime Blue/Green deployment with crash-recoverable checkpoints:
     1. [git_sync]       Git pull (if configured)
@@ -1167,7 +1168,7 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False):
             target_container = f"{name}-{target_slot}"
             old_container = f"{name}-{current_slot}" if current_slot else None
             phase = "git_sync"
-            commit = "n/a"
+            commit = requested_commit or "n/a"
             commit_msg = ""
             deploy_id = None
             journal = {
@@ -1179,7 +1180,7 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False):
                 "target_slot": target_slot,
                 "target_container": target_container,
                 "old_container": old_container,
-                "commit": None,
+                "commit": commit,
                 "commit_msg": None,
                 "deploy_id": None,
                 "started_at": int(time.time()),
@@ -1198,6 +1199,10 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False):
         # PHASE 1: GIT SYNC
         # ------------------------------------------------------------------
         if phase_idx <= PHASE_ORDER.index("git_sync"):
+            if not deploy_id:
+                deploy_id = record_deployment_start(name, commit, commit_msg, target_slot, triggered_by, domain)
+                journal["deploy_id"] = deploy_id
+                save_deploy_journal(name, journal)
             try:
                 if not no_pull:
                     commit, commit_msg = git_sync(app_dir, repo, branch)
@@ -1206,16 +1211,20 @@ def deploy_app(name, no_pull=False, triggered_by="cli", resume=False):
                         _cleanup_stale_git_locks(app_dir / ".git")
                         commit = run_cmd("git rev-parse --short HEAD", capture=True, cwd=app_dir)
                         commit_msg = run_cmd("git log -1 --pretty=%B", capture=True, cwd=app_dir).split("\n")[0]
+                record_deployment_commit(deploy_id, commit, commit_msg)
                 sync_repo_crons(name, app_dir)
             except Exception as e:
                 if _is_interrupted_by_shutdown(e):
                     print(f"==> [INTERRUPT] Git sync interrupted by system shutdown; journal kept at 'git_sync'.")
                     sys.exit(143)
+                error = f"git_sync: {e}"
+                print(f"[DEPLOYMENT FAILED] {error}")
+                record_deployment_finish(deploy_id, "FAILED", error_message=error)
                 clear_deploy_journal(name)
-                raise
-
-            if not deploy_id:
-                deploy_id = record_deployment_start(name, commit, commit_msg, target_slot, triggered_by, domain)
+                notify_git_sync_failure(name, target_slot, current_slot, commit, error, triggered_by)
+                if triggered_by == "autodeploy":
+                    return False
+                sys.exit(1)
 
             journal["commit"] = commit
             journal["commit_msg"] = commit_msg
@@ -1374,7 +1383,7 @@ networks:
                 err_msg = f"Build/Launch failed: {e}"
                 print(f"\n[DEPLOYMENT FAILED] {err_msg}")
                 record_deployment_finish(deploy_id, "FAILED", error_message=err_msg)
-                notify_deploy_failed(name, target_slot, current_slot, commit, err_msg, triggered_by)
+                notify_deploy_failed(name, target_slot, current_slot, commit, err_msg, triggered_by, phase="build")
                 clear_deploy_journal(name)
                 if compose_file.exists() and override_file.exists():
                     run_cmd(f"docker compose -p {name}-{target_slot} -f {compose_file.name} -f {override_file.name} down 2>/dev/null || true", cwd=app_dir)
@@ -1951,11 +1960,11 @@ def check_autodeploy():
             print(f"[AutoDeploy] New commit detected on '{name}' ({branch}): {deployed_commit or 'initial'} -> {remote_sha}")
             print(f"[AutoDeploy] Triggering automated zero-downtime deployment for '{name}'...")
             try:
-                ok = deploy_app(name, no_pull=False, triggered_by="autodeploy")
+                ok = deploy_app(name, no_pull=False, triggered_by="autodeploy", requested_commit=remote_sha)
                 if ok:
                     print(f"[AutoDeploy] Successfully auto-deployed '{name}' ({remote_sha}).")
                 else:
-                    print(f"[AutoDeploy] Auto-deployment failed for '{name}' ({remote_sha}). Alert delivered.")
+                    print(f"[AutoDeploy] Auto-deployment failed for '{name}' ({remote_sha}).")
             except Exception as e:
                 print(f"[AutoDeploy] Deployment exception on '{name}': {e}")
 
@@ -2013,6 +2022,14 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_deployments_app ON deployments(app, started_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS git_sync_alerts (
+                app TEXT PRIMARY KEY,
+                commit_hash TEXT NOT NULL,
+                error_message TEXT NOT NULL
+            )
+        """)
 
         # Disk consumption & differential metrics table
         conn.execute("""
@@ -2118,6 +2135,12 @@ def record_deployment_start(app, commit_hash, commit_msg, slot, triggered_by, do
             VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, ?, ?)
         """, (app, commit_hash, commit_msg, slot, started_at, triggered_by, domain))
         return cursor.lastrowid
+
+
+def record_deployment_commit(deploy_id, commit, commit_msg):
+    with get_db() as conn:
+        conn.execute("UPDATE deployments SET commit_hash = ?, commit_msg = ? WHERE id = ?",
+                     (commit, commit_msg, deploy_id))
 
 
 def record_deployment_finish(deploy_id, status, error_message=None):
@@ -2272,7 +2295,23 @@ def notify_deploy_success(app, slot, commit, commit_msg, domain, duration, trigg
     send_telegram(text)
 
 
-def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by):
+def notify_git_sync_failure(app, target_slot, live_slot, commit, error, triggered_by):
+    if triggered_by != "autodeploy":
+        notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase="git_sync")
+        return
+
+    with get_db() as conn:
+        previous = conn.execute(
+            "SELECT commit_hash, error_message FROM git_sync_alerts WHERE app = ?", (app,)
+        ).fetchone()
+    if previous == (commit, error):
+        return
+    if notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase="git_sync"):
+        with get_db() as conn:
+            conn.execute("INSERT OR REPLACE INTO git_sync_alerts VALUES (?, ?, ?)", (app, commit, error))
+
+
+def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_by, phase=None):
     hostname = run_cmd("hostname", capture=True) or "server"
     commit_disp = commit[:7] if commit else "unknown"
     safe_app = html.escape(str(app))
@@ -2286,9 +2325,17 @@ def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_b
         "cli": "👤 Manual (L'Amo CLI)",
         "rollback": "🛡️ Auto-Rollback (Fallo de salud)",
     }.get(triggered_by, f"👤 {html.escape(str(triggered_by))}")
+    subtitle = {
+        "git_sync": "Falló la preparación del repositorio antes de construir el despliegue",
+        "build": "Falló la construcción o el arranque del nuevo contenedor",
+    }.get(phase, "Healthcheck fallido · Rollback automático")
+    traffic_status = (
+        "El tráfico continúa en el slot activo."
+        if live_slot else "La aplicación aún no tiene un slot activo."
+    )
     text = (
         f"⚠️ <b>ES BOVER · FALLO EN DESPLIEGUE</b>\n"
-        f"<i>Healthcheck fallido · Rollback automático</i>\n\n"
+        f"<i>{subtitle}</i>\n\n"
         f"📦 <b>App:</b> <code>{safe_app}</code>\n"
         f"🖥️  <b>Nodo:</b> <code>{safe_host}</code>\n"
         f"🎯 <b>Slot Afectado:</b> <code>{safe_target}</code>\n"
@@ -2296,10 +2343,10 @@ def notify_deploy_failed(app, target_slot, live_slot, commit, error, triggered_b
         f"🔖 <b>Commit:</b> <code>{safe_commit}</code>\n"
         f"⚙️ <b>Disparador:</b> {trigger_display}\n\n"
         f"<blockquote>❌ <b>Error:</b> <code>{safe_error}</code>\n"
-        f"El tráfico continúa en el slot sano sin caída de servicio (Zero Downtime).</blockquote>\n\n"
-        f"<i>Es Bover Runtime :: Auto-Rollback</i>"
+        f"{traffic_status}</blockquote>\n\n"
+        f"<i>Es Bover Runtime :: Deployer</i>"
     )
-    send_telegram(text)
+    return send_telegram(text)
 
 
 def configure_telegram(bot_token, chat_id, test=True):

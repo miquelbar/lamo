@@ -18,6 +18,15 @@ CLEAN_NAME="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_' | cut -c1-18 | tr '[:uppe
 APP_USER="app_${CLEAN_NAME}"
 APP_DIR="/opt/apps/${APP_NAME}"
 
+share_git_directories() {
+    local git_dir="${APP_DIR}/.git"
+    if [[ ! -L "${APP_DIR}" && -d "${git_dir}" && ! -L "${git_dir}" ]]; then
+        # Fetch runs as bover even after the app user takes ownership.
+        # Keep existing directories writable and inherit the bover group.
+        runuser -u "${APP_USER}" -- find "${git_dir}" -type d -group bover -exec chmod g+rws {} +
+    fi
+}
+
 case "${ACTION}" in
     user-create)
         UID_VAL="${3:-}"
@@ -40,6 +49,7 @@ case "${ACTION}" in
         # Strictly set ownership and permissions (group write allows bover daemon state & config tracking)
         chown -R "${APP_USER}:bover" "${APP_DIR}"
         chmod 770 "${APP_DIR}"
+        share_git_directories
         if [[ -d "${APP_DIR}/data" ]]; then
             chmod 2770 "${APP_DIR}/data"
             find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
@@ -67,6 +77,7 @@ case "${ACTION}" in
             fi
             chown -R "${APP_USER}:bover" "${APP_DIR}"
             chmod 770 "${APP_DIR}"
+            share_git_directories
             if [[ -d "${APP_DIR}/data" ]]; then
                 chmod 2770 "${APP_DIR}/data"
                 find "${APP_DIR}/data" -type f -exec chmod 660 {} + 2>/dev/null || true
